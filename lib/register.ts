@@ -1599,13 +1599,64 @@ export async function autoRegisterAWS(
       await takeScreenshot(page, log, 'step2_after_name_input')
       
       // 点击第二个继续按钮（带错误检测和自动重试）
-      // 选择器: button[data-testid="signup-next-button"]
+      // 选择器：button[data-testid="signup-next-button"]
       const secondContinueSelector = 'button[data-testid="signup-next-button"]'
       if (!await waitAndClickWithRetry(page, secondContinueSelector, log, '第二个继续按钮')) {
         throw new Error('点击第二个继续按钮失败')
       }
       
       await page.waitForTimeout(3000)
+      
+      // 验证步骤2是否真正成功：检查是否出现了验证码输入框
+      log('验证步骤2是否成功：检查验证码输入框是否出现...')
+      let codePageAppeared = false
+      const maxNameRetries = 10
+      
+      for (let retry = 0; retry < maxNameRetries; retry++) {
+        try {
+          const codeInput = page.locator('input[placeholder="6-digit"]').first()
+          const isVisible = await codeInput.isVisible({ timeout: 5000 })
+          if (isVisible) {
+            log(`✓ 验证码页面已出现（第${retry + 1}次检查）`)
+            codePageAppeared = true
+            break
+          }
+        } catch {
+          // 忽略
+        }
+        
+        if (!codePageAppeared) {
+          // 检查是否有错误弹窗
+          const errorVisible = await page.locator('div[class*="awsui_content_"]').first().isVisible({ timeout: 2000 }).catch(() => false)
+          if (errorVisible) {
+            log(`⚠ 检测到错误弹窗（第${retry + 1}/${maxNameRetries}次），等待后重试...`)
+            await takeScreenshot(page, log, `name_step_retry_${retry + 1}`)
+            
+            // 尝试关闭错误弹窗
+            const closeBtn = page.locator('button[aria-label="关闭"], button[aria-label="Close"]').first()
+            if (await closeBtn.isVisible({ timeout: 2000 })) {
+              await closeBtn.click()
+              log('✓ 已关闭错误弹窗')
+            }
+            
+            // 重新点击继续按钮
+            log(`重新点击继续按钮（第${retry + 1}/${maxNameRetries}次）...`)
+            await waitAndClickWithRetry(page, secondContinueSelector, log, '第二个继续按钮（重试）', 10000, 1)
+            
+            await page.waitForTimeout(5000)
+          } else {
+            log(`等待验证码框出现...（第${retry + 1}/${maxNameRetries}次）`)
+            await page.waitForTimeout(3000)
+          }
+        }
+      }
+      
+      if (!codePageAppeared) {
+        log('✗ 多次重试后验证码输入框仍未出现，可能卡在了姓名步骤')
+        await takeScreenshot(page, log, 'stuck_at_name')
+        await dumpPageHtml(page, log, 'stuck_at_name')
+        throw new Error('姓名提交失败，无法进入验证码步骤（可能被 AWS 反检测拦截）')
+      }
       
       // 步骤3: 等待验证码输入框出现，获取并输入验证码
       log('\n步骤3: 获取并输入验证码...')
@@ -1689,6 +1740,58 @@ export async function autoRegisterAWS(
       }
       
       await page.waitForTimeout(3000)
+      
+      // 验证步骤3是否真正成功：检查是否出现了密码输入框
+      // 如果没出现，说明被 AWS 反检测拦截了，需要重试
+      log('验证步骤是否成功：检查密码输入框是否出现...')
+      let passwordPageAppeared = false
+      const maxVerificationRetries = 10
+      
+      for (let retry = 0; retry < maxVerificationRetries; retry++) {
+        try {
+          const passwordInput = page.locator('input[placeholder="Enter password"]').first()
+          const isVisible = await passwordInput.isVisible({ timeout: 5000 })
+          if (isVisible) {
+            log(`✓ 密码页面已出现（第${retry + 1}次检查）`)
+            passwordPageAppeared = true
+            break
+          }
+        } catch {
+          // 忽略
+        }
+        
+        if (!passwordPageAppeared) {
+          // 检查是否有错误弹窗
+          const errorVisible = await page.locator('div[class*="awsui_content_"]').first().isVisible({ timeout: 2000 }).catch(() => false)
+          if (errorVisible) {
+            log(`⚠ 检测到错误弹窗（第${retry + 1}/${maxVerificationRetries}次），等待后重试...`)
+            await takeScreenshot(page, log, `verification_retry_${retry + 1}`)
+            
+            // 尝试关闭错误弹窗
+            const closeBtn = page.locator('button[aria-label="关闭"], button[aria-label="Close"]').first()
+            if (await closeBtn.isVisible({ timeout: 2000 })) {
+              await closeBtn.click()
+              log('✓ 已关闭错误弹窗')
+            }
+            
+            // 重新点击 Continue 按钮
+            log(`重新点击 Continue 按钮（第${retry + 1}/${maxVerificationRetries}次）...`)
+            await waitAndClickWithRetry(page, verifyButtonSelector, log, 'Continue 按钮（重试）', 10000, 1)
+            
+            await page.waitForTimeout(5000)
+          } else {
+            log(`等待密码框出现...（第${retry + 1}/${maxVerificationRetries}次）`)
+            await page.waitForTimeout(3000)
+          }
+        }
+      }
+      
+      if (!passwordPageAppeared) {
+        log('✗ 多次重试后密码输入框仍未出现，可能卡在了验证码步骤')
+        await takeScreenshot(page, log, 'stuck_at_verification')
+        await dumpPageHtml(page, log, 'stuck_at_verification')
+        throw new Error('验证码提交失败，无法进入密码设置页面（可能被 AWS 反检测拦截）')
+      }
       
       // 步骤4: 等待密码输入框出现，输入密码
       log('\n步骤4: 输入密码...')
