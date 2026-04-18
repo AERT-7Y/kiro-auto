@@ -164,5 +164,85 @@ export function generateAdvancedOverrides(profile: {
   } catch (e) {
     console.warn('[Fingerprint] Failed to override Connection:', e);
   }
+  
+  // ============ Chrome Object (for Chrome detection) ============
+  try {
+    if (!window.chrome) {
+      window.chrome = {
+        runtime: {
+          OnInstalledReason: { CHROME_UPDATE: "chrome_update", INSTALL: "install", SHARED_MODULE_UPDATE: "shared_module_update", UPDATE: "update" },
+          OnRestartRequiredReason: { APP_UPDATE: "app_update", OS_UPDATE: "os_update", PERIODIC: "periodic" },
+          PlatformArch: { ARM: "arm", ARM64: "arm64", MIPS: "mips", MIPS64: "mips64", MIPS64EL: "mips64el", MIPSel: "mipsel", X86_32: "x86-32", X86_64: "x86-64" },
+          PlatformNaclArch: { ARM: "arm", MIPS: "mips", MIPS64: "mips64", MIPS64EL: "mips64el", MIPSel: "mipsel", MIPSel64: "mipsel64", X86_32: "x86-32", X86_64: "x86-64" },
+          PlatformOs: { ANDROID: "android", CROS: "cros", LINUX: "linux", MAC: "mac", OPENBSD: "openbsd", WIN: "win" },
+          RequestUpdateCheckStatus: { NO_UPDATE: "no_update", THROTTLED: "throttled", UPDATE_AVAILABLE: "update_available" }
+        },
+        app: {
+          isInstalled: false,
+          InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" },
+          RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" }
+        }
+      };
+    }
+    
+    console.log('[Fingerprint] Chrome object injected');
+  } catch (e) {
+    console.warn('[Fingerprint] Failed to inject Chrome object:', e);
+  }
+  
+  // ============ Notification API ============
+  try {
+    if (window.Notification) {
+      const originalNotification = window.Notification;
+      window.Notification = function(title, options) {
+        // 静默处理通知请求
+        return {
+          close: function() {},
+          addEventListener: function() {},
+          removeEventListener: function() {},
+          dispatchEvent: function() { return true; }
+        };
+      };
+      window.Notification.permission = 'default';
+      window.Notification.requestPermission = function() {
+        return Promise.resolve('default');
+      };
+    }
+    
+    console.log('[Fingerprint] Notification API overridden');
+  } catch (e) {
+    console.warn('[Fingerprint] Failed to override Notification:', e);
+  }
+  
+  // ============ WebDriver Detection Bypass ============
+  try {
+    // 删除 webdriver 属性
+    delete Object.getPrototypeOf(navigator).webdriver;
+    
+    // 覆盖 Chrome 的自动化检测
+    Object.defineProperty(window, 'cdc_adoQpoasnfa76pfcZLmcfl_', {
+      get: function() { return undefined; },
+      set: function(val) { return true; }
+    });
+    
+    Object.defineProperty(window, 'cdc_adoQpoasnfa76pfcZLmcfl_Array', {
+      get: function() { return undefined; },
+      set: function(val) { return true; }
+    });
+    
+    Object.defineProperty(window, 'cdc_adoQpoasnfa76pfcZLmcfl_Promise', {
+      get: function() { return undefined; },
+      set: function(val) { return true; }
+    });
+    
+    Object.defineProperty(window, 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol', {
+      get: function() { return undefined; },
+      set: function(val) { return true; }
+    });
+    
+    console.log('[Fingerprint] WebDriver detection bypassed');
+  } catch (e) {
+    console.warn('[Fingerprint] Failed to bypass WebDriver detection:', e);
+  }
 `;
 }

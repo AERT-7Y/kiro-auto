@@ -70,3 +70,7 @@ env/
 *.temp
 .DS_Store?
 
+# Project specific
+kiro_auto_manager-master/
+.trae/
+

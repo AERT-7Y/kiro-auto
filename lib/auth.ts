@@ -1,3 +1,5 @@
+import { fetch } from 'undici'
+
 export type BuilderIdStartResult =
   | {
       success: true
@@ -48,7 +50,7 @@ export async function startBuilderIdDeviceLogin(region: string): Promise<Builder
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        clientName: 'AWS Account Tool',
+        clientName: 'Kiro Account Manager',
         clientType: 'public',
         scopes: DEFAULT_SCOPES,
         grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],
@@ -159,4 +161,3 @@ export async function pollBuilderIdDeviceAuth(params: {
     return { success: false, error: e instanceof Error ? e.message : String(e) }
   }
 }
-

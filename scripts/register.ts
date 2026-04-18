@@ -206,6 +206,14 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
     }
 
     try {
+      // 设置代理环境变量（让 fetch 请求也走代理）
+      if (opts.proxyUrl) {
+        process.env.HTTP_PROXY = opts.proxyUrl
+        process.env.HTTPS_PROXY = opts.proxyUrl
+        process.env.http_proxy = opts.proxyUrl
+        process.env.https_proxy = opts.proxyUrl
+      }
+      
       log('正在向 AWS 伸手要设备码...')
       const start = await startBuilderIdDeviceLogin(opts.region)
       if (!start.success) {
