@@ -21,10 +21,12 @@ async function takeScreenshot(
   try {
     await ensureScreenshotDir()
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const filename = `${name}_${timestamp}.png`
+    const urlStr = page.url().replace(/[^\w]/g, '_').substring(0, 60)
+    const filename = `${name}_${urlStr}_${timestamp}.png`
     const filepath = path.join(SCREENSHOT_DIR, filename)
     await page.screenshot({ path: filepath, fullPage })
-    log(`📸 截图已保存: ${filepath}`)
+    log(`📸 截图已保存：${filepath}`)
+    log(`   当前 URL: ${page.url()}`)
     return filepath
   } catch (error) {
     log(`📸 截图失败: ${error}`)
@@ -40,11 +42,13 @@ async function dumpPageHtml(
   try {
     await ensureScreenshotDir()
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const filename = `${name}_${timestamp}.html`
+    const urlStr = page.url().replace(/[^\w]/g, '_').substring(0, 60)
+    const filename = `${name}_${urlStr}_${timestamp}.html`
     const filepath = path.join(SCREENSHOT_DIR, filename)
     const html = await page.content()
     fs.writeFileSync(filepath, html, 'utf-8')
-    log(`📄 HTML 已保存: ${filepath}`)
+    log(`📄 HTML 已保存：${filepath}`)
+    log(`   当前 URL: ${page.url()}`)
   } catch (error) {
     log(`📄 HTML 保存失败: ${error}`)
   }
