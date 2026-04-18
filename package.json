@@ -1,0 +1,22 @@
+{
+  "name": "aws-account-tool",
+  "version": "1.0.0",
+  "description": "AWS Builder ID Account Management Tool",
+  "main": "./scripts/switch.ts",
+  "author": "developer",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "switch": "tsx scripts/switch.ts",
+    "register": "tsx scripts/register.ts",
+    "install-browser": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.57.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.6",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

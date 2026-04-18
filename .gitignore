@@ -1,0 +1,71 @@
+# Dependencies
+node_modules
+.pnpm-store
+
+# Build outputs
+dist
+out
+build
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+*.log.*
+logs/
+docs/*.log
+
+# Cache
+.eslintcache
+.cache
+.temp
+.tmp
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Electron
+electron-v*.zip
+*.asar
+
+# Package manager
+.pnpm-debug.log*
+.yarn/
+.npm/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# User data (sensitive)
+*.backup.json
+kiro-accounts.json
+
+# Kiro development artifacts
+.kiro/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store?
