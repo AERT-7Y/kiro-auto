@@ -1,6 +1,54 @@
 import { chromium, Browser, Page } from 'playwright'
+import * as path from 'path'
+import * as fs from 'fs'
 
 type LogCallback = (message: string) => void
+
+const SCREENSHOT_DIR = path.join(process.cwd(), 'show', 'screenshots')
+
+async function ensureScreenshotDir() {
+  if (!fs.existsSync(SCREENSHOT_DIR)) {
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true })
+  }
+}
+
+async function takeScreenshot(
+  page: Page,
+  log: LogCallback,
+  name: string,
+  fullPage: boolean = false
+): Promise<string | null> {
+  try {
+    await ensureScreenshotDir()
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `${name}_${timestamp}.png`
+    const filepath = path.join(SCREENSHOT_DIR, filename)
+    await page.screenshot({ path: filepath, fullPage })
+    log(`📸 截图已保存: ${filepath}`)
+    return filepath
+  } catch (error) {
+    log(`📸 截图失败: ${error}`)
+    return null
+  }
+}
+
+async function dumpPageHtml(
+  page: Page,
+  log: LogCallback,
+  name: string
+): Promise<void> {
+  try {
+    await ensureScreenshotDir()
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `${name}_${timestamp}.html`
+    const filepath = path.join(SCREENSHOT_DIR, filename)
+    const html = await page.content()
+    fs.writeFileSync(filepath, html, 'utf-8')
+    log(`📄 HTML 已保存: ${filepath}`)
+  } catch (error) {
+    log(`📄 HTML 保存失败: ${error}`)
+  }
+}
 
 const CODE_PATTERNS = [
   /(?:verification\s*code|验证码|Your code is|code is)[：:\s]*(\d{6})/gi,
@@ -796,6 +844,8 @@ async function waitAndFill(
     return true
   } catch (error) {
     log(`✗ ${description}操作失败: ${error}`)
+    await takeScreenshot(page, log, `error_${description.replace(/\s+/g, '_')}`)
+    await dumpPageHtml(page, log, `error_${description.replace(/\s+/g, '_')}`)
     return false
   }
 }
@@ -879,6 +929,8 @@ async function checkAndRetryOnError(
           if (text && errorTexts.some(errText => text.includes(errText))) {
             hasError = true
             log(`⚠ 检测到错误弹窗: "${text.substring(0, 80)}..."`)
+            await takeScreenshot(page, log, `error_dialog_${description.replace(/\s+/g, '_')}`)
+            await dumpPageHtml(page, log, `error_dialog_${description.replace(/\s+/g, '_')}`)
             break
           }
         }
@@ -1379,6 +1431,8 @@ export async function autoRegisterAWS(
     log(`✓ 页面加载完成${incognitoMode ? '（无痕模式）' : ''}${useFingerprint ? '（指纹已应用）' : ''}`)
     await page.waitForTimeout(2000)
     
+    await takeScreenshot(page, log, 'step1_page_loaded')
+    
     // 等待邮箱输入框出现并输入邮箱
     // 选择器: input[placeholder="username@example.com"]
     const emailInputSelector = 'input[placeholder="username@example.com"]'
@@ -1542,6 +1596,7 @@ export async function autoRegisterAWS(
       }
       
       await page.waitForTimeout(1000)
+      await takeScreenshot(page, log, 'step2_after_name_input')
       
       // 点击第二个继续按钮（带错误检测和自动重试）
       // 选择器: button[data-testid="signup-next-button"]
@@ -1554,6 +1609,7 @@ export async function autoRegisterAWS(
       
       // 步骤3: 等待验证码输入框出现，获取并输入验证码
       log('\n步骤3: 获取并输入验证码...')
+      await takeScreenshot(page, log, 'step3_before_code_input')
       // 选择器: 支持多种 placeholder（英文和中文）
       const codeInputSelectors = [
         'input[placeholder="6-digit"]',
@@ -1636,6 +1692,7 @@ export async function autoRegisterAWS(
       
       // 步骤4: 等待密码输入框出现，输入密码
       log('\n步骤4: 输入密码...')
+      await takeScreenshot(page, log, 'step4_before_password')
       // 选择器: input[placeholder="Enter password"]
       const passwordInputSelector = 'input[placeholder="Enter password"]'
       if (!await waitAndFill(page, passwordInputSelector, password, log, '密码输入框')) {
@@ -1652,6 +1709,7 @@ export async function autoRegisterAWS(
       }
       
       await page.waitForTimeout(1000)
+      await takeScreenshot(page, log, 'step4_after_password_input')
       
       // 点击第三个继续按钮（带错误检测和自动重试）
       // 选择器: button[data-testid="test-primary-button"]
@@ -1661,6 +1719,7 @@ export async function autoRegisterAWS(
       }
       
       await page.waitForTimeout(5000)
+      await takeScreenshot(page, log, 'step4_after_confirm')
     }
     
     // 步骤5: 等待并点击 "Confirm and continue" 授权按钮（注册和登录流程共用）
@@ -1818,7 +1877,22 @@ export async function autoRegisterAWS(
   } catch (error) {
     log(`\n✗ 注册失败: ${error}`)
     if (browser) {
-      try { await browser.close() } catch {}
+      try {
+        let page: Page | null = null
+        try {
+          const pages = await browser.pages()
+          page = pages[0] || null
+        } catch {}
+        if (page) {
+          await takeScreenshot(page, log, 'final_error')
+          await dumpPageHtml(page, log, 'final_error')
+        } else {
+          log('无法获取页面截图（浏览器可能未正确初始化）')
+        }
+        await browser.close()
+      } catch (e) {
+        log(`关闭浏览器时出错: ${e}`)
+      }
     }
     return { success: false, error: error instanceof Error ? error.message : String(error) }
   }
