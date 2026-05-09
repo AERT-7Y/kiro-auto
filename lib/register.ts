@@ -1,6 +1,25 @@
 import { chromium, Browser, Page } from 'playwright'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 type LogCallback = (message: string) => void
+type TempMailMessage = {
+  id?: string
+  from: string
+  subject: string
+  body?: string
+  html?: string
+  text?: string
+}
+
+type CloudflareTempEmailConfig = {
+  baseUrl: string
+  adminAuth: string
+  customAuth: string
+  domain: string
+  useRandomSubdomain: boolean
+}
 
 const CODE_PATTERNS = [
   /(?:verification\s*code|验证码|Your code is|code is)[：:\s]*(\d{6})/gi,
@@ -21,6 +40,211 @@ const AWS_SENDERS = [
 
 const FIRST_NAMES = ['James', 'Robert', 'John', 'Michael', 'David', 'William', 'Richard', 'Maria', 'Elizabeth', 'Jennifer', 'Linda', 'Barbara', 'Susan', 'Jessica']
 const LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez', 'Wilson', 'Anderson', 'Thomas', 'Taylor']
+
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+function loadDotEnvFiles(paths: string[] = ['.env.local', '.env']): void {
+  for (const path of paths) {
+    const candidates = [resolve(PROJECT_ROOT, path), resolve(process.cwd(), path)]
+    for (const abs of candidates) {
+      if (!existsSync(abs)) continue
+
+      const content = readFileSync(abs, 'utf-8')
+      for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim()
+        if (!line || line.startsWith('#')) continue
+
+        const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
+        if (!match) continue
+
+        const key = match[1]
+        if (process.env[key] !== undefined) continue
+
+        let value = match[2].trim()
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1)
+        }
+        process.env[key] = value
+      }
+    }
+  }
+}
+
+loadDotEnvFiles()
+
+function firstNonEmptyString(values: Array<unknown>): string {
+  for (const value of values) {
+    if (value === undefined || value === null) continue
+    const normalized = String(value).trim()
+    if (normalized) return normalized
+  }
+  return ''
+}
+
+function generateAliasLocalPart(): string {
+  const letters = 'abcdefghijklmnopqrstuvwxyz'
+  const digits = '0123456789'
+  const chars: string[] = []
+
+  for (let i = 0; i < 6; i++) chars.push(letters[Math.floor(Math.random() * letters.length)])
+  for (let i = 0; i < 4; i++) chars.push(digits[Math.floor(Math.random() * digits.length)])
+
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+
+  return chars.join('')
+}
+
+function normalizeCloudflareTempEmailBaseUrl(rawValue = ''): string {
+  const value = String(rawValue || '').trim()
+  if (!value) return ''
+
+  const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(value) ? value : `https://${value}`
+  try {
+    const parsed = new URL(candidate)
+    parsed.hash = ''
+    parsed.search = ''
+    const pathname = parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/+$/, '')
+    return `${parsed.origin}${pathname}`
+  } catch {
+    return ''
+  }
+}
+
+function normalizeCloudflareTempEmailDomain(rawValue = ''): string {
+  let value = String(rawValue || '').trim().toLowerCase()
+  if (!value) return ''
+  value = value.replace(/^@+/, '')
+  value = value.replace(/^https?:\/\//, '')
+  value = value.replace(/\/.*$/, '')
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(value)) return ''
+  return value
+}
+
+function parseBooleanEnv(value?: string): boolean {
+  return /^(1|true|yes|y|on)$/i.test(String(value || '').trim())
+}
+
+function getCloudflareTempEmailConfig(): CloudflareTempEmailConfig {
+  return {
+    baseUrl: normalizeCloudflareTempEmailBaseUrl(process.env.CLOUDFLARE_TEMP_EMAIL_BASE_URL),
+    adminAuth: String(process.env.CLOUDFLARE_TEMP_EMAIL_ADMIN_AUTH || ''),
+    customAuth: String(process.env.CLOUDFLARE_TEMP_EMAIL_CUSTOM_AUTH || ''),
+    domain: normalizeCloudflareTempEmailDomain(process.env.CLOUDFLARE_TEMP_EMAIL_DOMAIN),
+    useRandomSubdomain: parseBooleanEnv(process.env.CLOUDFLARE_TEMP_EMAIL_USE_RANDOM_SUBDOMAIN)
+  }
+}
+
+function buildCloudflareTempEmailHeaders(config: CloudflareTempEmailConfig, json = false): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  if (config.adminAuth) headers['x-admin-auth'] = config.adminAuth
+  if (config.customAuth) headers['x-custom-auth'] = config.customAuth
+  if (json) headers['Content-Type'] = 'application/json'
+  return headers
+}
+
+function joinCloudflareTempEmailUrl(baseUrl: string, path: string): string {
+  const normalizedBase = normalizeCloudflareTempEmailBaseUrl(baseUrl)
+  const normalizedPath = String(path || '').trim()
+  if (!normalizedBase || !normalizedPath) return normalizedBase || ''
+  return `${normalizedBase}${normalizedPath.startsWith('/') ? '' : '/'}${normalizedPath}`
+}
+
+function getCloudflareTempEmailMailRows(payload: unknown): any[] {
+  if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== 'object') return []
+
+  const obj = payload as Record<string, any>
+  const candidates = [obj.data, obj.items, obj.messages, obj.mails, obj.results, obj.rows]
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate
+  }
+  return []
+}
+
+function getCloudflareTempEmailAddressFromResponse(payload: any): string {
+  return firstNonEmptyString([
+    payload?.address,
+    payload?.email,
+    payload?.data?.address,
+    payload?.data?.email
+  ]).toLowerCase()
+}
+
+function normalizeCloudflareTempEmailMessage(row: any): TempMailMessage | null {
+  if (!row || typeof row !== 'object') return null
+
+  const raw = firstNonEmptyString([row.raw, row.source, row.mime, row.message])
+  const from = firstNonEmptyString([
+    row.from?.emailAddress?.address,
+    row.from,
+    row.sender,
+    row.mail_from
+  ])
+  const subject = firstNonEmptyString([row.subject, row.title])
+  const body = firstNonEmptyString([row.text, row.preview, row.body, row.bodyPreview, raw])
+  const html = firstNonEmptyString([row.html, row.htmlBody, raw])
+
+  return {
+    id: firstNonEmptyString([row.id, row.mail_id]),
+    from,
+    subject,
+    body,
+    html,
+    text: body
+  }
+}
+
+async function requestCloudflareTempEmailJson(
+  config: CloudflareTempEmailConfig,
+  path: string,
+  options: { method?: string; payload?: unknown; searchParams?: Record<string, unknown>; timeoutMs?: number } = {}
+): Promise<any> {
+  const method = options.method || 'GET'
+  const timeoutMs = options.timeoutMs || 20000
+  const url = new URL(joinCloudflareTempEmailUrl(config.baseUrl, path))
+
+  for (const [key, value] of Object.entries(options.searchParams || {})) {
+    if (value === undefined || value === null || value === '') continue
+    url.searchParams.set(key, String(value))
+  }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url.toString(), {
+      method,
+      headers: buildCloudflareTempEmailHeaders(config, options.payload !== undefined),
+      body: options.payload !== undefined ? JSON.stringify(options.payload) : undefined,
+      signal: controller.signal
+    })
+    const text = await response.text()
+    let parsed: any = {}
+    try {
+      parsed = text ? JSON.parse(text) : {}
+    } catch {
+      parsed = text
+    }
+
+    if (!response.ok) {
+      const payloadError = parsed && typeof parsed === 'object'
+        ? (parsed.message || parsed.error || parsed.msg)
+        : ''
+      throw new Error(payloadError || text || `HTTP ${response.status}`)
+    }
+
+    return parsed
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(message === 'This operation was aborted'
+      ? `Cloudflare Temp Email 请求超时（>${Math.round(timeoutMs / 1000)} 秒）`
+      : `Cloudflare Temp Email 请求失败：${message}`)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
 
 function generateRandomName(): string {
   const first = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)]
@@ -324,252 +548,51 @@ export async function createTempMail(
   log: LogCallback,
   timeout: number = 30
 ): Promise<{ email: string; token: string; password?: string } | null> {
-  const yydsMailApiKey = process.env.YYDS_MAIL_API_KEY || process.env.MALIAPI_215_API_KEY
-  const services = [
-    {
-      name: '215.im (YYDS Mail)',
-      createUrl: 'https://maliapi.215.im/v1/accounts',
-      inboxUrl: (_token: string, email: string) => `https://maliapi.215.im/v1/messages?address=${email}`,
-      maxAttempts: 10,
-      preferredDomain: '0m0.abrdns.com'
-    },
-    {
-      name: 'tempmail.lol',
-      createUrl: 'https://api.tempmail.lol/v2/inbox/create',
-      inboxUrl: (token: string) => `https://api.tempmail.lol/v2/inbox?token=${token}`,
-      maxAttempts: 10
-    },
-    {
-      name: 'mail.tm',
-      createUrl: 'https://api.mail.tm/accounts',
-      inboxUrl: (_token: string) => `https://api.mail.tm/messages`,
-      requiresAuth: true,
-      maxAttempts: 5
-    },
-    {
-      name: '1secmail.com',
-      createUrl: 'https://www.1secmail.com/api/v1/?action=genRandomMailbox&count=1',
-      inboxUrl: (email: string) => `https://www.1secmail.com/api/v1/?action=getMessages&login=${email.split('@')[0]}&domain=${email.split('@')[1]}`,
-      maxAttempts: 5
-    },
-    {
-      name: 'tempmail.plus',
-      createUrl: 'https://tempmail.plus/api/mails',
-      inboxUrl: (email: string) => `https://tempmail.plus/api/mails/${email}`,
-      maxAttempts: 5
-    },
-    {
-      name: 'guerrillamail.com',
-      createUrl: 'https://api.guerrillamail.com/ajax.php?f=get_email_address',
-      inboxUrl: (token: string) => `https://api.guerrillamail.com/ajax.php?f=get_email_list&sid_token=${token}`,
-      maxAttempts: 3
-    }
-  ]
-  
-  for (const service of services) {
-    log(`========== 尝试从 ${service.name} 申请临时邮箱（尝试多个域名）==========`)
-    const startTime = Date.now()
-    let attemptCount = 0
-    const usedDomains = new Set<string>()
-    
-    while (Date.now() - startTime < timeout * 1000 && attemptCount < service.maxAttempts) {
-      try {
-        attemptCount++
-        
-        if (service.name === '215.im (YYDS Mail)') {
-          if (!yydsMailApiKey) {
-            log('  ⚠ 未设置 YYDS_MAIL_API_KEY（或 MALIAPI_215_API_KEY），跳过 215.im 服务')
-            break
-          }
-          
-          const randomPrefix = Math.random().toString(36).substring(2, 10)
-          const requestBody = {
-            address: randomPrefix,
-            domain: '0m0.abrdns.com'
-          }
-          
-          log(`  尝试创建邮箱: ${randomPrefix}@0m0.abrdns.com (使用 API Key)`)
-          
-          const resp = await fetch(service.createUrl, {
-            method: 'POST',
-            headers: {
-              'X-API-Key': yydsMailApiKey,
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json',
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(requestBody)
-          })
-          
-          if (resp.ok) {
-            const result = await resp.json() as { success: boolean; data?: { address: string; token: string } }
-            if (result.success && result.data && result.data.address && result.data.token) {
-              const domain = result.data.address.split('@')[1]
-              usedDomains.add(domain)
-              
-              const password = Math.random().toString(36).slice(-8) + 'A1!'
-              log(`✓ 成功获取临时邮箱: ${result.data.address} (域名: ${domain})`)
-              log(`  Token: ${result.data.token.substring(0, 20)}...`)
-              return { email: result.data.address, token: result.data.token, password }
-            } else {
-              log(`  API 返回格式错误: ${JSON.stringify(result)}`)
-            }
-          } else {
-            const errorText = await resp.text()
-            log(`  第 ${attemptCount} 次请求失败: ${resp.status} - ${errorText}`)
-          }
-        } else if (service.name === 'tempmail.lol') {
-          const resp = await fetch(service.createUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'application/json'
-            }
-          })
-          
-          if (resp.ok) {
-            const data = await resp.json() as { address: string; token: string }
-            if (data.address && data.token) {
-              const domain = data.address.split('@')[1]
-              usedDomains.add(domain)
-              
-              const password = Math.random().toString(36).slice(-8) + 'A1!'
-              log(`✓ 成功获取临时邮箱: ${data.address} (域名: ${domain}, 第 ${attemptCount} 次尝试)`)
-              log(`  已尝试的域名: ${Array.from(usedDomains).join(', ')}`)
-              return { email: data.address, token: data.token, password }
-            }
-          } else {
-            log(`  第 ${attemptCount} 次请求失败: ${resp.status}`)
-          }
-        } else if (service.name === '1secmail.com') {
-          const resp = await fetch(service.createUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json'
-            }
-          })
-          
-          if (resp.ok) {
-            const data = await resp.json() as string[]
-            if (data && data.length > 0 && data[0]) {
-              const email = data[0]
-              const domain = email.split('@')[1]
-              usedDomains.add(domain)
-              
-              const password = Math.random().toString(36).slice(-8) + 'A1!'
-              log(`✓ 成功获取临时邮箱: ${email} (域名: ${domain}, 第 ${attemptCount} 次尝试)`)
-              return { email, token: email, password }
-            }
-          }
-        } else if (service.name === 'tempmail.plus') {
-          const resp = await fetch(service.createUrl, {
-            method: 'POST',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json',
-              'Content-Type': 'application/json'
-            }
-          })
-          
-          if (resp.ok) {
-            const data = await resp.json() as { email: string; token?: string }
-            if (data && data.email) {
-              const domain = data.email.split('@')[1]
-              usedDomains.add(domain)
-              
-              const password = Math.random().toString(36).slice(-8) + 'A1!'
-              log(`✓ 成功获取临时邮箱: ${data.email} (域名: ${domain}, 第 ${attemptCount} 次尝试)`)
-              return { email: data.email, token: data.token || data.email, password }
-            }
-          }
-        } else if (service.name === 'guerrillamail.com') {
-          const resp = await fetch(service.createUrl, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Accept': 'application/json'
-            }
-          })
-          
-          if (resp.ok) {
-            const data = await resp.json() as { email_addr: string; sid_token: string }
-            if (data && data.email_addr && data.sid_token) {
-              const domain = data.email_addr.split('@')[1]
-              usedDomains.add(domain)
-              
-              const password = Math.random().toString(36).slice(-8) + 'A1!'
-              log(`✓ 成功获取临时邮箱: ${data.email_addr} (域名: ${domain}, 第 ${attemptCount} 次尝试)`)
-              return { email: data.email_addr, token: data.sid_token, password }
-            }
-          }
-        } else if (service.name === 'mail.tm') {
-          const randomUser = 'user' + Math.random().toString(36).slice(-8)
-          const password = Math.random().toString(36).slice(-8) + 'A1!'
-          
-          const domainsResp = await fetch('https://api.mail.tm/domains', {
-            headers: {
-              'Accept': 'application/json'
-            }
-          })
-          
-          if (!domainsResp.ok) {
-            log(`mail.tm 获取域名失败，跳过`)
-            break
-          }
-          
-          const domainsData = await domainsResp.json() as { 'hydra:member': Array<{ domain: string }> }
-          const domains = domainsData['hydra:member'] || []
-          
-          if (domains.length === 0) {
-            log(`mail.tm 无可用域名，跳过`)
-            break
-          }
-          
-          const email = `${randomUser}@${domains[0].domain}`
-          
-          const createResp = await fetch(service.createUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify({ address: email, password })
-          })
-          
-          if (!createResp.ok) {
-            log(`mail.tm 创建账号失败: ${createResp.status}`)
-            break
-          }
-          
-          const loginResp = await fetch('https://api.mail.tm/token', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify({ address: email, password })
-          })
-          
-          if (loginResp.ok) {
-            const loginData = await loginResp.json() as { token: string }
-            if (loginData.token) {
-              log(`✓ 成功获取临时邮箱: ${email}`)
-              return { email, token: loginData.token, password }
-            }
-          }
-        }
-      } catch (error) {
-        log(`${service.name} 第 ${attemptCount} 次申请失败: ${error}`)
-      }
-      
-      if (attemptCount < service.maxAttempts) {
-        await new Promise(r => setTimeout(r, 500))
-      }
-    }
-    
-    log(`✗ ${service.name} 尝试了 ${attemptCount} 次，获取的域名: ${Array.from(usedDomains).join(', ')}`)
-    log(`  继续尝试下一个服务...`)
+  const config = getCloudflareTempEmailConfig()
+  if (!config.baseUrl || !config.adminAuth || !config.domain) {
+    log('⚠ Cloudflare Temp Email 配置不完整，必须设置 CLOUDFLARE_TEMP_EMAIL_BASE_URL / CLOUDFLARE_TEMP_EMAIL_ADMIN_AUTH / CLOUDFLARE_TEMP_EMAIL_DOMAIN')
+    return null
   }
-  
-  log('✗ 所有临时邮箱服务均失败')
+
+  const maxAttempts = 3
+  const startTime = Date.now()
+  let attemptCount = 0
+  log('========== 使用 Cloudflare Temp Email 创建临时邮箱 ==========')
+
+  while (Date.now() - startTime < timeout * 1000 && attemptCount < maxAttempts) {
+    attemptCount++
+    try {
+      const localPart = generateAliasLocalPart()
+      const payload = {
+        enablePrefix: true,
+        enableRandomSubdomain: config.useRandomSubdomain,
+        name: localPart,
+        domain: config.domain
+      }
+
+      log(`  第 ${attemptCount}/${maxAttempts} 次创建邮箱: ${localPart}@${config.domain}`)
+      const result = await requestCloudflareTempEmailJson(config, '/admin/new_address', {
+        method: 'POST',
+        payload
+      })
+      const address = getCloudflareTempEmailAddressFromResponse(result)
+      if (address) {
+        const password = Math.random().toString(36).slice(-8) + 'A1!'
+        log(`✓ 成功获取临时邮箱: ${address}`)
+        return { email: address, token: `cloudflare-temp-email:${address}`, password }
+      }
+
+      log(`  API 返回格式错误: ${JSON.stringify(result)}`)
+    } catch (error) {
+      log(`Cloudflare Temp Email 第 ${attemptCount} 次申请失败: ${error}`)
+    }
+
+    if (attemptCount < maxAttempts) {
+      await new Promise(r => setTimeout(r, 500))
+    }
+  }
+
+  log('✗ Cloudflare Temp Email 创建邮箱失败')
   return null
 }
 
@@ -579,215 +602,68 @@ export async function getTempMailCode(
   log: LogCallback,
   timeout: number = 120
 ): Promise<string | null> {
-  log(`========== 开始等待邮箱 ${email} 收到 AWS 验证码 ==========`)
-  
-  const emailDomain = email.split('@')[1]?.toLowerCase() || ''
-  const is215Im = emailDomain.includes('abrdns') || emailDomain.includes('yyds.dev')
-  const isMailTm = emailDomain.includes('mail.tm') || emailDomain.endsWith('.tm')
-  const is1SecMail = emailDomain.includes('1secmail') || emailDomain.includes('esiix') || emailDomain.includes('wwjmp') || emailDomain.includes('icznn')
-  const isTempMailPlus = emailDomain.includes('tempmail.plus') || emailDomain.includes('tmpbox')
-  const isGuerrillaMail = emailDomain.includes('guerrillamail') || emailDomain.includes('grr.la') || emailDomain.includes('sharklasers')
-  
-  let serviceName = 'tempmail.lol'
-  if (is215Im) serviceName = '215.im'
-  else if (isMailTm) serviceName = 'mail.tm'
-  else if (is1SecMail) serviceName = '1secmail.com'
-  else if (isTempMailPlus) serviceName = 'tempmail.plus'
-  else if (isGuerrillaMail) serviceName = 'guerrillamail.com'
-  
-  log(`[DEBUG] 邮箱域名: ${emailDomain}, 使用服务: ${serviceName}`)
-  
+  log(`========== 开始等待 Cloudflare Temp Email ${email} 收到 AWS 验证码 ==========`)
+
+  const config = getCloudflareTempEmailConfig()
+  if (!config.baseUrl || !config.adminAuth) {
+    log('Cloudflare Temp Email 配置不完整，无法轮询邮件')
+    return null
+  }
+
   const startTime = Date.now()
   const checkInterval = 3000
   const seenIds = new Set<string>()
-  
+
   while (Date.now() - startTime < timeout * 1000) {
     try {
-      let messages: Array<{ from: string; subject: string; body?: string; html?: string; text?: string }> = []
-      
-      if (serviceName === '215.im') {
-        const url = `https://maliapi.215.im/v1/messages?address=${encodeURIComponent(email)}`
-        const resp = await fetch(url, {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as { success: boolean; data?: { messages: Array<{ id: string; from: { address: string }; subject: string; text?: string; html?: string[] }> } }
-          if (data.success && data.data && data.data.messages) {
-            for (const msg of data.data.messages) {
-              try {
-                const detailResp = await fetch(`https://maliapi.215.im/v1/messages/${msg.id}`, {
-                  headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Accept': 'application/json'
-                  }
-                })
-                
-                if (detailResp.ok) {
-                  const detailData = await detailResp.json() as { success: boolean; data?: { text?: string; html?: string[] } }
-                  if (detailData.success && detailData.data) {
-                    messages.push({
-                      from: msg.from.address,
-                      subject: msg.subject,
-                      body: detailData.data.text || '',
-                      html: Array.isArray(detailData.data.html) ? detailData.data.html.join('') : detailData.data.html
-                    })
-                  }
-                } else {
-                  messages.push({
-                    from: msg.from.address,
-                    subject: msg.subject,
-                    body: msg.text || '',
-                    html: Array.isArray(msg.html) ? msg.html.join('') : msg.html
-                  })
-                }
-              } catch (e) {
-                log(`获取邮件 ${msg.id} 详情失败: ${e}`)
-              }
-            }
-          }
+      const payload = await requestCloudflareTempEmailJson(config, '/admin/mails', {
+        method: 'GET',
+        searchParams: {
+          limit: 20,
+          offset: 0,
+          address: email
         }
-      } else if (serviceName === 'mail.tm') {
-        const resp = await fetch('https://api.mail.tm/messages', {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as { 'hydra:member': Array<{ id: string; from: { address: string }; subject: string; intro: string }> }
-          messages = (data['hydra:member'] || []).map(msg => ({
-            from: msg.from.address,
-            subject: msg.subject,
-            body: msg.intro,
-            html: msg.intro
-          }))
-        }
-      } else if (serviceName === '1secmail.com') {
-        const [login, domain] = email.split('@')
-        const url = `https://www.1secmail.com/api/v1/?action=getMessages&login=${login}&domain=${domain}`
-        const resp = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as Array<{ id: number; from: string; subject: string; date: string }>
-          for (const msg of data || []) {
-            const detailResp = await fetch(`https://www.1secmail.com/api/v1/?action=readMessage&login=${login}&domain=${domain}&id=${msg.id}`)
-            if (detailResp.ok) {
-              const detail = await detailResp.json() as { body: string; htmlBody: string; textBody: string }
-              messages.push({
-                from: msg.from,
-                subject: msg.subject,
-                body: detail.textBody || detail.body,
-                html: detail.htmlBody
-              })
-            }
-          }
-        }
-      } else if (serviceName === 'tempmail.plus') {
-        const url = `https://tempmail.plus/api/mails/${email}`
-        const resp = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as { mails: Array<{ from: string; subject: string; body: string; html: string }> }
-          messages = (data.mails || []).map(msg => ({
-            from: msg.from,
-            subject: msg.subject,
-            body: msg.body,
-            html: msg.html
-          }))
-        }
-      } else if (serviceName === 'guerrillamail.com') {
-        const url = `https://api.guerrillamail.com/ajax.php?f=get_email_list&sid_token=${token}`
-        const resp = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as { list: Array<{ mail_id: string; mail_from: string; mail_subject: string; mail_excerpt: string }> }
-          for (const msg of data.list || []) {
-            const detailResp = await fetch(`https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token=${token}&email_id=${msg.mail_id}`)
-            if (detailResp.ok) {
-              const detail = await detailResp.json() as { mail_body: string }
-              messages.push({
-                from: msg.mail_from,
-                subject: msg.mail_subject,
-                body: detail.mail_body,
-                html: detail.mail_body
-              })
-            }
-          }
-        }
-      } else {
-        const url = `https://api.tempmail.lol/v2/inbox?token=${token}`
-        const resp = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json'
-          }
-        })
-        
-        if (resp.ok) {
-          const data = await resp.json() as { emails: Array<{ from: string; subject: string; body: string; html: string }> }
-          messages = data.emails || []
-        }
-      }
-      
+      })
+      const messages = getCloudflareTempEmailMailRows(payload)
+        .map((row) => normalizeCloudflareTempEmailMessage(row))
+        .filter((message): message is TempMailMessage => Boolean(message))
+
       if (!messages || messages.length === 0) {
         await new Promise(r => setTimeout(r, checkInterval))
         continue
       }
-      
+
       for (const msg of messages) {
         const content = `${msg.body || ''}\n${msg.html || ''}\n${msg.text || ''}`
-        const msgHash = `${msg.subject?.substring(0,20)}_${content.length}`
-        
+        const msgHash = msg.id || `${msg.subject?.substring(0, 20)}_${content.length}`
         if (seenIds.has(msgHash)) continue
         seenIds.add(msgHash)
-        
+
         const sender = (msg.from || '').toLowerCase()
         const subject = (msg.subject || '').toLowerCase()
-        
         const isAwsSender = AWS_SENDERS.some(s => sender.includes(s.toLowerCase()))
-        if (!isAwsSender && !subject.includes('aws') && !subject.includes('amazon') && !content.includes('aws')) {
+        if (!isAwsSender && !subject.includes('aws') && !subject.includes('amazon') && !content.toLowerCase().includes('aws')) {
           continue
         }
-        
+
         log(`\n=== 收到新邮件 ===`)
         log(`  发件人: ${sender}`)
         log(`  主题: ${subject}`)
-        
+
         const bodyText = htmlToText(msg.html || '') || msg.body || ''
-        let code = extractCode(subject) || extractCode(bodyText) || extractCode(content)
-        
+        const code = extractCode(subject) || extractCode(bodyText) || extractCode(content)
         if (code) {
           log(`\n========== 找到验证码: ${code} ==========`)
           return code
         }
       }
-    } catch (error) {
-       // 忽略错误，继续轮询
+    } catch {
+      // 忽略单次轮询错误，继续等待
     }
-    
+
     await new Promise(r => setTimeout(r, checkInterval))
   }
-  
+
   log('✗ 获取验证码超时')
   return null
 }
@@ -818,14 +694,59 @@ async function waitAndFill(
     await element.clear()
     
     for (const char of value) {
-      await page.keyboard.type(char)
-      await randomDelay(50, 150)
+      await element.pressSequentially(char, { delay: Math.floor(Math.random() * 100) + 50 })
     }
-    
+
+    await element.evaluate((el) => {
+      const input = el as HTMLInputElement
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+      input.blur()
+    }).catch(() => {})
+
+    const actualValue = await element.inputValue().catch(() => '')
+    if (actualValue !== value) {
+      log(`⚠ ${description}当前值和预期不一致，重填一次: "${actualValue}"`)
+      await element.click()
+      await element.fill(value)
+      await element.evaluate((el) => {
+        const input = el as HTMLInputElement
+        input.dispatchEvent(new Event('input', { bubbles: true }))
+        input.dispatchEvent(new Event('change', { bubbles: true }))
+        input.blur()
+      }).catch(() => {})
+    }
+
     log(`✓ 已输入${description}: ${value}`)
     return true
   } catch (error) {
     log(`✗ ${description}操作失败: ${error}`)
+    return false
+  }
+}
+
+async function humanClickElement(page: Page, element: ReturnType<Page['locator']>, log: LogCallback, description: string): Promise<boolean> {
+  try {
+    await element.waitFor({ state: 'visible', timeout: 10000 })
+    await element.scrollIntoViewIfNeeded().catch(() => {})
+
+    const box = await element.boundingBox()
+    if (!box) {
+      await element.click({ force: true })
+      return true
+    }
+
+    const targetX = box.x + box.width / 2 + (Math.random() - 0.5) * Math.min(12, box.width * 0.2)
+    const targetY = box.y + box.height / 2 + (Math.random() - 0.5) * Math.min(8, box.height * 0.2)
+    await simulateMouseMove(page, targetX, targetY)
+    await randomDelay(250, 700)
+    await page.mouse.down()
+    await randomDelay(80, 180)
+    await page.mouse.up()
+    await randomDelay(300, 800)
+    return true
+  } catch (error) {
+    log(`✗ ${description}真实鼠标点击失败: ${error}`)
     return false
   }
 }
@@ -939,7 +860,7 @@ async function checkAndRetryOnError(
       try {
         const button = page.locator(buttonSelector).first()
         await button.waitFor({ state: 'visible', timeout: 5000 })
-        await button.click()
+        await humanClickElement(page, button, log, description)
         log(`✓ 已重新点击${description}`)
       } catch (e) {
         log(`✗ 重新点击${description}失败: ${e}`)
@@ -971,8 +892,10 @@ async function waitAndClickWithRetry(
       await simulateMouseMove(page, targetX, targetY)
     }
     
-    await randomDelay(100, 300)
-    await element.click()
+    await randomDelay(300, 800)
+    if (!await humanClickElement(page, element, log, description)) {
+      return false
+    }
     log(`✓ 已点击${description}`)
     
     const success = await checkAndRetryOnError(page, selector, log, description, maxRetries)
@@ -987,20 +910,22 @@ export async function activateOutlook(
   email: string,
   emailPassword: string,
   log: LogCallback,
-  incognitoMode: boolean = true
+  incognitoMode: boolean = true,
+  headless: boolean = true
 ): Promise<{ success: boolean; error?: string }> {
   const activationUrl = 'https://go.microsoft.com/fwlink/p/?linkid=2125442'
   let browser: Browser | null = null
   
   log('========== 开始激活 Outlook 邮箱 ==========')
   log(`无痕模式: ${incognitoMode ? '已启用' : '已禁用'}`)
+  log(`浏览器显示: ${headless ? '后台运行' : '前台可见'}`)
   log(`邮箱: ${email}`)
   
   try {
-    log(`\n步骤1: 启动浏览器${incognitoMode ? '（无痕模式）' : ''}（后台运行），访问 Outlook 激活页面...`)
+    log(`\n步骤1: 启动浏览器${incognitoMode ? '（无痕模式）' : ''}${headless ? '（后台运行）' : '（前台可见）'}，访问 Outlook 激活页面...`)
     
     const launchOptions: any = {
-      headless: true,
+      headless,
       args: ['--disable-blink-features=AutomationControlled']
     }
     
@@ -1230,11 +1155,12 @@ export async function autoRegisterAWS(
   userCode?: string,
   verificationUri?: string,
   useFingerprint: boolean = true,
-  fingerprintProfile?: any
+  fingerprintProfile?: any,
+  headless: boolean = true
 ): Promise<{ success: boolean; ssoToken?: string; name?: string; error?: string; email?: string; password?: string }> {
   let tempMailToken = ''
   if (useTempMail) {
-    const tempResult = await createTempMail(log)
+    const tempResult = await createTempMail(log, 30)
     if (!tempResult) {
       return { success: false, error: '获取临时邮箱失败' }
     }
@@ -1256,7 +1182,7 @@ export async function autoRegisterAWS(
   log(`无痕模式: ${incognitoMode ? '已启用' : '已禁用'}`)
   if (!skipOutlookActivation && email.toLowerCase().includes('outlook') && emailPassword) {
     log('检测到 Outlook 邮箱，先进行激活（不使用代理）...')
-    const activationResult = await activateOutlook(email, emailPassword, log)
+    const activationResult = await activateOutlook(email, emailPassword, log, incognitoMode, headless)
     if (!activationResult.success) {
       log(`⚠ Outlook 激活可能未完成: ${activationResult.error}`)
       log('继续尝试 AWS 注册...')
@@ -1274,6 +1200,7 @@ export async function autoRegisterAWS(
     log(`代理: ${proxyUrl}`)
   }
   log(`使用指纹: ${useFingerprint ? '是' : '否'}`)
+  log(`浏览器显示: ${headless ? '后台运行' : '前台可见'}`)
   
   let profile: any = fingerprintProfile
   if (useFingerprint && !profile) {
@@ -1288,10 +1215,10 @@ export async function autoRegisterAWS(
   }
   
   try {
-    log(`\n步骤1: 启动浏览器${incognitoMode ? '（无痕模式）' : ''}${useFingerprint ? '（应用指纹）' : ''}（后台运行），进入注册页面...`)
+    log(`\n步骤1: 启动浏览器${incognitoMode ? '（无痕模式）' : ''}${useFingerprint ? '（应用指纹）' : ''}${headless ? '（后台运行）' : '（前台可见）'}，进入注册页面...`)
     
     const launchOptions: any = {
-      headless: true,
+      headless,
       proxy: proxyUrl ? { server: proxyUrl } : undefined,
       args: ['--disable-blink-features=AutomationControlled']
     }
@@ -1873,6 +1800,7 @@ export type TempMailRegisterOptions = {
   verificationUri?: string
   useFingerprint?: boolean
   fingerprintProfile?: any
+  headless?: boolean
 }
 
 export async function registerAwsBuilderIdTempMail(
@@ -1891,6 +1819,7 @@ export async function registerAwsBuilderIdTempMail(
     options.userCode,
     options.verificationUri,
     options.useFingerprint ?? true,
-    options.fingerprintProfile
+    options.fingerprintProfile,
+    options.headless ?? true
   )
 }

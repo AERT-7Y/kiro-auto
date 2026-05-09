@@ -1,9 +1,10 @@
-import { mkdir, writeFile, readFile } from 'node:fs/promises'
+import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { execSync } from 'node:child_process'
-import { registerAwsBuilderIdTempMail } from '../lib/register'
+import { createTempMail, registerAwsBuilderIdTempMail } from '../lib/register'
 import { startBuilderIdDeviceLogin, pollBuilderIdDeviceAuth } from '../lib/auth'
+import { KiroRsAdminClient } from '../lib/kiro-rs-admin'
 
 if (process.platform === 'win32') {
   try {
@@ -18,6 +19,33 @@ process.stdin.setEncoding?.('utf8')
 process.stdout.setDefaultEncoding?.('utf8')
 process.stderr.setDefaultEncoding?.('utf8')
 
+function loadDotEnvFiles(paths: string[] = ['.env.local', '.env']): void {
+  for (const path of paths) {
+    const abs = resolve(path)
+    if (!existsSync(abs)) continue
+
+    const content = readFileSync(abs, 'utf-8')
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith('#')) continue
+
+      const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/)
+      if (!match) continue
+
+      const key = match[1]
+      if (process.env[key] !== undefined) continue
+
+      let value = match[2].trim()
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1)
+      }
+      process.env[key] = value
+    }
+  }
+}
+
+loadDotEnvFiles()
+
 type CliOptions = {
   count: number
   concurrency: number
@@ -25,10 +53,15 @@ type CliOptions = {
   proxyUrl?: string
   incognitoMode: boolean
   useFingerprint: boolean
-  outputPath: string
+  headless: boolean
   region: string
-  emitBuilderIdTemplate: boolean
-  templateOutputPath: string
+  publishKiroRs: boolean
+  kiroRsUrl: string
+  kiroRsKey: string
+  kiroRsPriority: number
+  kiroRsEndpoint?: string
+  kiroRsAuthRegion?: string
+  kiroRsApiRegion?: string
 }
 
 const COLORS = {
@@ -56,6 +89,22 @@ function toInt(value: string | undefined, fallback: number) {
   return Number.isFinite(n) ? n : fallback
 }
 
+function firstEnv(...names: string[]): string {
+  for (const name of names) {
+    const value = process.env[name]
+    if (value && value.trim()) return value.trim()
+  }
+  return ''
+}
+
+function parseBooleanEnv(value: string | undefined, fallback = false): boolean {
+  const text = String(value || '').trim()
+  if (!text) return fallback
+  if (/^(1|true|yes|y|on)$/i.test(text)) return true
+  if (/^(0|false|no|n|off)$/i.test(text)) return false
+  return fallback
+}
+
 function parseArgs(argv: string[]): Partial<CliOptions> {
   const get = (name: string) => {
     const idx = argv.indexOf(name)
@@ -79,17 +128,32 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
   if (has('--proxyUrl') || has('--proxy')) {
     result.proxyUrl = get('--proxyUrl') ?? get('--proxy')
   }
-  if (has('--output')) {
-    result.outputPath = get('--output')
-  }
   if (has('--region')) {
     result.region = get('--region')
   }
-  if (has('--emit-builderid-template') || has('--emit-builderid') || has('--builderid-template')) {
-    result.emitBuilderIdTemplate = true
+  if (has('--kiro-rs-url')) {
+    result.kiroRsUrl = get('--kiro-rs-url')
   }
-  if (has('--templateOutput')) {
-    result.templateOutputPath = get('--templateOutput')
+  if (has('--kiro-rs-key')) {
+    result.kiroRsKey = get('--kiro-rs-key')
+  }
+  if (has('--priority') || has('--kiro-rs-priority')) {
+    result.kiroRsPriority = toInt(get('--priority') ?? get('--kiro-rs-priority'), 0)
+  }
+  if (has('--endpoint')) {
+    result.kiroRsEndpoint = get('--endpoint')
+  }
+  if (has('--auth-region')) {
+    result.kiroRsAuthRegion = get('--auth-region')
+  }
+  if (has('--api-region')) {
+    result.kiroRsApiRegion = get('--api-region')
+  }
+  if (has('--publish-kiro-rs')) {
+    result.publishKiroRs = true
+  }
+  if (has('--no-publish-kiro-rs')) {
+    result.publishKiroRs = false
   }
   if (has('--incognito')) {
     result.incognitoMode = true
@@ -103,17 +167,14 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
   if (has('--no-fingerprint')) {
     result.useFingerprint = false
   }
+  if (has('--headed') || has('--show-browser')) {
+    result.headless = false
+  }
+  if (has('--headless')) {
+    result.headless = true
+  }
 
   return result
-}
-
-async function fileExists(path: string) {
-  try {
-    await readFile(path, 'utf-8')
-    return true
-  } catch {
-    return false
-  }
 }
 
 async function runWithConcurrency<TItem>(
@@ -135,23 +196,24 @@ async function runWithConcurrency<TItem>(
 }
 
 const DEFAULT_OPTIONS: CliOptions = {
-  count: 1,
-  concurrency: 1,
+  count: 3,
+  concurrency: 3,
   delayMs: 0,
   proxyUrl: undefined,
   incognitoMode: true,
   useFingerprint: true,
-  outputPath: 'show/results.json',
-  region: 'us-east-1',
-  emitBuilderIdTemplate: true,
-  templateOutputPath: 'show/builderid-template.json'
+  headless: false,
+  region: process.env.KIRO_AUTH_REGION || 'us-east-1',
+  publishKiroRs: parseBooleanEnv(process.env.KIRO_RS_UPLOAD_ENABLED, true),
+  kiroRsUrl: firstEnv('KIRO_RS_ADMIN_URL', 'KIRO_RS_URL') || 'https://kiro.leftcode.xyz/admin',
+  kiroRsKey: firstEnv('KIRO_RS_ADMIN_KEY', 'KIRO_RS_SK', 'KIRO_RS_API_KEY', 'ADMIN_API_KEY'),
+  kiroRsPriority: toInt(process.env.KIRO_RS_PRIORITY, 0),
+  kiroRsEndpoint: process.env.KIRO_RS_ENDPOINT,
+  kiroRsAuthRegion: process.env.KIRO_RS_AUTH_REGION,
+  kiroRsApiRegion: process.env.KIRO_RS_API_REGION
 }
 
 async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: number }> {
-  const outPathAbs = resolve(opts.outputPath)
-  const outDirAbs = resolve(opts.outputPath, '..')
-  await mkdir(outDirAbs, { recursive: true })
-
   const startedAt = Date.now()
   const total = Math.max(1, opts.count)
 
@@ -177,15 +239,12 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
   logInfo(`🔥 奥里给！准备造 ${opts.count} 个账号！并发 ${opts.concurrency} 个！`)
   logInfo(`   (AWS: 你们礼貌吗？？？)\n`)
 
-  const templateOutAbs = resolve(opts.templateOutputPath)
   
   const allRecords: Array<{
     email?: string
-    password?: string
     name?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
+    uploadedToKiroRs?: boolean
+    kiroRsCredentialId?: number
     success: boolean
     error?: string
   }> = new Array(total).fill(null)
@@ -216,7 +275,7 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
       
       log('正在向 AWS 伸手要设备码...')
       const start = await startBuilderIdDeviceLogin(opts.region)
-      if (!start.success) {
+      if (start.success === false) {
         throw new Error(start.error)
       }
 
@@ -228,16 +287,19 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
         incognitoMode: opts.incognitoMode,
         userCode: start.userCode,
         verificationUri: start.verificationUri,
-        useFingerprint: opts.useFingerprint
+        useFingerprint: opts.useFingerprint,
+        headless: opts.headless
       })
 
-      let refreshToken: string | undefined
-      let clientId: string | undefined
-      let clientSecret: string | undefined
+      let uploadedToKiroRs = false
+      let kiroRsCredentialId: number | undefined
 
-      if (opts.emitBuilderIdTemplate && result.success) {
+      if (result.success) {
         const endAt = start.expiresAt
         let intervalMs = Math.max(1000, start.interval * 1000)
+        let refreshToken: string | undefined
+        let clientId: string | undefined
+        let clientSecret: string | undefined
 
         log('等 AWS 确认中...（它可能懵了）')
         while (Date.now() < endAt) {
@@ -248,11 +310,11 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
             deviceCode: start.deviceCode
           })
 
-          if (!poll.success) {
+          if (poll.success === false) {
             throw new Error(poll.error)
           }
 
-          if (poll.completed) {
+          if (poll.completed === true) {
             refreshToken = poll.refreshToken
             clientId = poll.clientId
             clientSecret = poll.clientSecret
@@ -266,15 +328,44 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
 
           await new Promise((r) => setTimeout(r, intervalMs))
         }
+
+        if (!refreshToken || !clientId || !clientSecret) {
+          throw new Error('AWS 授权已完成页面流程，但未取到 refreshToken/clientId/clientSecret')
+        }
+
+        if (opts.publishKiroRs) {
+          if (!opts.kiroRsKey) {
+            throw new Error('缺少 kiro.rs admin API key；请在 .env 配置 KIRO_RS_ADMIN_KEY')
+          }
+          const admin = new KiroRsAdminClient({
+            baseUrl: opts.kiroRsUrl,
+            apiKey: opts.kiroRsKey,
+            log: (message) => log(message)
+          })
+          const upload = await admin.addBuilderIdCredential({
+            refreshToken,
+            clientId,
+            clientSecret,
+            region: opts.region,
+            email: result.email
+          }, {
+            priority: opts.kiroRsPriority,
+            endpoint: opts.kiroRsEndpoint,
+            authRegion: opts.kiroRsAuthRegion,
+            apiRegion: opts.kiroRsApiRegion,
+            proxyUrl: opts.proxyUrl
+          })
+          uploadedToKiroRs = upload.success
+          kiroRsCredentialId = upload.credentialId || upload.credential_id
+          log(`✓ 已自动发布到 kiro.rs${kiroRsCredentialId ? `，credentialId=${kiroRsCredentialId}` : ''}`)
+        }
       }
 
       allRecords[idx] = {
         email: result.email,
-        password: result.password,
         name: result.name,
-        refreshToken,
-        clientId,
-        clientSecret,
+        uploadedToKiroRs,
+        kiroRsCredentialId,
         success: result.success,
         error: result.error
       }
@@ -300,7 +391,6 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
   const elapsedMs = Date.now() - startedAt
   const elapsedSec = Math.round(elapsedMs / 1000)
 
-  const successRecords = allRecords.filter(r => r?.success && r?.refreshToken)
 
   print('')
   if (ok > 0 && fail === 0) {
@@ -314,23 +404,7 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
     log('dim', `   (是不是网不行？还是 AWS 开挂了？)`)
   }
 
-  await writeFile(outPathAbs, JSON.stringify(allRecords.filter(Boolean), null, 2), { encoding: 'utf-8' })
-  log('green', `\n📁 结果文件已保存: ${outPathAbs}`)
-
-  if (opts.emitBuilderIdTemplate && successRecords.length > 0) {
-    const templateDirAbs = resolve(opts.templateOutputPath, '..')
-    await mkdir(templateDirAbs, { recursive: true })
-    const templateData = successRecords.map(r => ({
-      email: r.email,
-      password: r.password,
-      refreshToken: r.refreshToken,
-      clientId: r.clientId,
-      clientSecret: r.clientSecret
-    }))
-    await writeFile(templateOutAbs, JSON.stringify(templateData, null, 2), { encoding: 'utf-8' })
-    log('green', `📁 模板文件已保存: ${templateOutAbs}`)
-    log('dim', `   (拿去切换工具用，别浪费了！)`)
-  }
+  log('dim', '\n授权信息不会写本地 show/*.json；开启 kiro.rs 发布时会自动上传')
 
   return { ok, fail }
 }
@@ -373,7 +447,8 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
     log('dim', `│ 每个隔多久: ${currentOptions.delayMs}ms`)
     log('dim', `│ 隐身模式: ${currentOptions.incognitoMode ? '✅ 开着呢' : '❌ 关了'}`)
     log('dim', `│ 指纹伪装: ${currentOptions.useFingerprint ? '✅ 伪装中' : '❌ 原始状态'}`)
-    log('dim', `│ 生成模板: ${currentOptions.emitBuilderIdTemplate ? '✅ 会生成' : '❌ 不生成'}`)
+    log('dim', `│ 浏览器显示: ${currentOptions.headless ? '❌ 后台运行' : '✅ 前台可见'}`)
+    log('dim', `│ 发布 kiro.rs: ${currentOptions.publishKiroRs ? '✅ 自动发布' : '❌ 不发布'}`)
     if (currentOptions.proxyUrl) {
       log('dim', `│ 走代理: ${currentOptions.proxyUrl}`)
     } else {
@@ -388,53 +463,14 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
     print(COLORS.cyan + '│' + COLORS.reset + '  [4] 改一下间隔时间')
     print(COLORS.cyan + '│' + COLORS.reset + '  [5] 切换隐身模式')
     print(COLORS.cyan + '│' + COLORS.reset + '  [6] 切换指纹伪装')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [7] 切换是否生成模板')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [8] 设置代理 (不想被追踪就设一个)')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [9] 看看历史战绩')
+    print(COLORS.cyan + '│' + COLORS.reset + '  [7] 切换浏览器显示')
+    print(COLORS.cyan + '│' + COLORS.reset + '  [8] 切换是否发布 kiro.rs')
+    print(COLORS.cyan + '│' + COLORS.reset + '  [9] 设置代理')
     print(COLORS.cyan + '│' + COLORS.reset + '  [0] 退出 (不玩了)')
     log('cyan', '└─────────────────────────────────────────────')
     print('')
   }
 
-  const showHistory = async () => {
-    const resultPath = resolve(currentOptions.outputPath)
-    const templatePath = resolve(currentOptions.templateOutputPath)
-
-    print('')
-    log('cyan', '═══ 📊 历史战绩 ═══')
-
-    if (await fileExists(templatePath)) {
-      try {
-        const raw = await readFile(templatePath, 'utf-8')
-        const items = JSON.parse(raw)
-        log('green', `✅ 模板文件: ${templatePath}`)
-        log('dim', `   已有 ${Array.isArray(items) ? items.length : 0} 个账号躺在这里`)
-      } catch {
-        log('yellow', `⚠️ 模板文件读不了: ${templatePath}`)
-      }
-    } else {
-      log('yellow', `⚠️ 模板文件不存在: ${templatePath}`)
-      log('dim', `   (还没注册过账号吧？)`)
-    }
-
-    if (await fileExists(resultPath)) {
-      try {
-        const raw = await readFile(resultPath, 'utf-8')
-        const records = JSON.parse(raw)
-        const success = records.filter((r: any) => r.success).length
-        const failed = records.filter((r: any) => !r.success).length
-        log('dim', `📝 结果文件: ${resultPath}`)
-        log('dim', `   总共 ${records.length} 条记录 (成功: ${success}, 失败: ${failed})`)
-        if (failed > success) {
-          log('yellow', `   (失败率有点高啊，是不是 AWS 发现你了？)`)
-        }
-      } catch {
-        log('yellow', `⚠️ 结果文件读不了: ${resultPath}`)
-      }
-    } else {
-      log('yellow', `⚠️ 结果文件不存在: ${resultPath}`)
-    }
-  }
 
   await showMenu()
 
@@ -522,16 +558,26 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
       }
 
       case '7': {
-        currentOptions.emitBuilderIdTemplate = !currentOptions.emitBuilderIdTemplate
-        if (currentOptions.emitBuilderIdTemplate) {
-          log('green', '✓ 会生成模板文件 (方便切换工具使用)')
+        currentOptions.headless = !currentOptions.headless
+        if (currentOptions.headless) {
+          log('green', '✓ 浏览器改为后台运行')
         } else {
-          log('yellow', '⚠️ 不生成模板 (注册了也白注册)')
+          log('green', '✓ 浏览器改为前台可见，你可以直接看注册流程')
         }
         break
       }
 
       case '8': {
+        currentOptions.publishKiroRs = !currentOptions.publishKiroRs
+        if (currentOptions.publishKiroRs) {
+          log('green', '✓ 注册成功后会自动发布到 kiro.rs')
+        } else {
+          log('yellow', '⚠️ 已关闭 kiro.rs 自动发布')
+        }
+        break
+      }
+
+      case '9': {
         const current = currentOptions.proxyUrl || '无'
         const answer = await question(`代理地址 (留空清除) [当前: ${current}]: `)
         if (answer.trim() === '') {
@@ -542,11 +588,6 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
           log('green', `✓ 代理设为: ${answer.trim()}`)
           log('dim', '  (希望你的代理靠谱)')
         }
-        break
-      }
-
-      case '9': {
-        await showHistory()
         break
       }
 
@@ -577,6 +618,20 @@ async function main() {
   const cliArgs = parseArgs(process.argv.slice(2))
   const hasCliArgs = Object.keys(cliArgs).length > 0
   const nonInteractive = process.argv.includes('--non-interactive') || process.argv.includes('-y')
+  const testMailProvider = process.argv.includes('--test-mail')
+
+  if (testMailProvider) {
+    const opts: CliOptions = { ...DEFAULT_OPTIONS, ...cliArgs }
+    log('cyan', '正在自测 Cloudflare Temp Email')
+    const result = await createTempMail((message) => log('dim', message), 15)
+    if (!result) {
+      log('red', '✗ Cloudflare Temp Email 自测失败')
+      process.exitCode = 1
+      return
+    }
+    log('green', `✓ Cloudflare Temp Email 自测成功: ${result.email}`)
+    return
+  }
 
   if (hasCliArgs && nonInteractive) {
     const opts: CliOptions = { ...DEFAULT_OPTIONS, ...cliArgs }
