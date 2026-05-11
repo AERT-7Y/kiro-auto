@@ -9,9 +9,11 @@
   "scripts": {
     "switch": "tsx scripts/switch.ts",
     "register": "tsx scripts/register.ts",
-    "install-browser": "npx playwright install chromium"
+    "install-browser": "npx playwright install chromium",
+    "probe:kiro-login": "tsx scripts/probe-kiro-login.ts"
   },
   "dependencies": {
+    "cbor": "^9.0.2",
     "playwright": "^1.57.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",

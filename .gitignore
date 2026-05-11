@@ -56,6 +56,8 @@ kiro-accounts.json
 
 # Kiro development artifacts
 .kiro/
+artifacts/
+.browser-profile/
 
 # Python
 __pycache__/
@@ -75,3 +77,6 @@ env/
 kiro_auto_manager-master/
 .trae/
 
+
+# Local input files
+txt/*.txt

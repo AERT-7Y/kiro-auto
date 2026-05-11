@@ -2,9 +2,13 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { execSync } from 'node:child_process'
-import { createTempMail, registerAwsBuilderIdTempMail } from '../lib/register'
+import { createTempMail, registerAwsBuilderIdTempMail, type RegistrationBrowserSession } from '../lib/register'
 import { startBuilderIdDeviceLogin, pollBuilderIdDeviceAuth } from '../lib/auth'
 import { KiroRsAdminClient } from '../lib/kiro-rs-admin'
+import { createEventLogger, maskEmail, redactSecrets } from '../lib/common'
+import { loadSubscribeInput, updateAccountStatus } from '../lib/pro-input'
+import { extractCheckoutSessionId, KiroClient, readSubscriptionState } from '../lib/kiro-client'
+import { runStripeCheckout } from '../lib/stripe-checkout'
 
 if (process.platform === 'win32') {
   try {
@@ -62,6 +66,12 @@ type CliOptions = {
   kiroRsEndpoint?: string
   kiroRsAuthRegion?: string
   kiroRsApiRegion?: string
+  autoProTrial: boolean
+  proTxtDir: string
+  proProfileDir: string
+  proResultPath: string
+  proEventsPath: string
+  proReuseProfile: boolean
 }
 
 const COLORS = {
@@ -105,6 +115,14 @@ function parseBooleanEnv(value: string | undefined, fallback = false): boolean {
   return fallback
 }
 
+function resolveRequiredArg(value: string | undefined, name: string): string {
+  const text = String(value || '').trim()
+  if (!text || text.startsWith('--')) {
+    throw new Error(`参数 ${name} 缺少值`)
+  }
+  return text
+}
+
 function parseArgs(argv: string[]): Partial<CliOptions> {
   const get = (name: string) => {
     const idx = argv.indexOf(name)
@@ -117,37 +135,37 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
   const result: Partial<CliOptions> = {}
 
   if (has('--count') || has('-n')) {
-    result.count = toInt(get('--count') ?? get('-n'), 1)
+    result.count = toInt(resolveRequiredArg(get('--count') ?? get('-n'), '--count'), 1)
   }
   if (has('--concurrency') || has('-c')) {
-    result.concurrency = toInt(get('--concurrency') ?? get('-c'), 1)
+    result.concurrency = toInt(resolveRequiredArg(get('--concurrency') ?? get('-c'), '--concurrency'), 1)
   }
   if (has('--delayMs') || has('--delay') || has('-d')) {
-    result.delayMs = toInt(get('--delayMs') ?? get('--delay') ?? get('-d'), 0)
+    result.delayMs = toInt(resolveRequiredArg(get('--delayMs') ?? get('--delay') ?? get('-d'), '--delayMs'), 0)
   }
   if (has('--proxyUrl') || has('--proxy')) {
-    result.proxyUrl = get('--proxyUrl') ?? get('--proxy')
+    result.proxyUrl = resolveRequiredArg(get('--proxyUrl') ?? get('--proxy'), '--proxy')
   }
   if (has('--region')) {
-    result.region = get('--region')
+    result.region = resolveRequiredArg(get('--region'), '--region')
   }
   if (has('--kiro-rs-url')) {
-    result.kiroRsUrl = get('--kiro-rs-url')
+    result.kiroRsUrl = resolveRequiredArg(get('--kiro-rs-url'), '--kiro-rs-url')
   }
   if (has('--kiro-rs-key')) {
-    result.kiroRsKey = get('--kiro-rs-key')
+    result.kiroRsKey = resolveRequiredArg(get('--kiro-rs-key'), '--kiro-rs-key')
   }
   if (has('--priority') || has('--kiro-rs-priority')) {
-    result.kiroRsPriority = toInt(get('--priority') ?? get('--kiro-rs-priority'), 0)
+    result.kiroRsPriority = toInt(resolveRequiredArg(get('--priority') ?? get('--kiro-rs-priority'), '--priority'), 0)
   }
   if (has('--endpoint')) {
-    result.kiroRsEndpoint = get('--endpoint')
+    result.kiroRsEndpoint = resolveRequiredArg(get('--endpoint'), '--endpoint')
   }
   if (has('--auth-region')) {
-    result.kiroRsAuthRegion = get('--auth-region')
+    result.kiroRsAuthRegion = resolveRequiredArg(get('--auth-region'), '--auth-region')
   }
   if (has('--api-region')) {
-    result.kiroRsApiRegion = get('--api-region')
+    result.kiroRsApiRegion = resolveRequiredArg(get('--api-region'), '--api-region')
   }
   if (has('--publish-kiro-rs')) {
     result.publishKiroRs = true
@@ -173,6 +191,27 @@ function parseArgs(argv: string[]): Partial<CliOptions> {
   if (has('--headless')) {
     result.headless = true
   }
+  if (has('--auto-pro-trial') || has('--check-pro-trial')) {
+    result.autoProTrial = true
+  }
+  if (has('--no-auto-pro-trial')) {
+    result.autoProTrial = false
+  }
+  if (has('--pro-txt-dir')) {
+    result.proTxtDir = resolve(resolveRequiredArg(get('--pro-txt-dir'), '--pro-txt-dir'))
+  }
+  if (has('--pro-profile')) {
+    result.proProfileDir = resolve(resolveRequiredArg(get('--pro-profile'), '--pro-profile'))
+  }
+  if (has('--pro-output')) {
+    result.proResultPath = resolve(resolveRequiredArg(get('--pro-output'), '--pro-output'))
+  }
+  if (has('--pro-events')) {
+    result.proEventsPath = resolve(resolveRequiredArg(get('--pro-events'), '--pro-events'))
+  }
+  if (has('--pro-reuse-profile')) {
+    result.proReuseProfile = true
+  }
 
   return result
 }
@@ -197,7 +236,7 @@ async function runWithConcurrency<TItem>(
 
 const DEFAULT_OPTIONS: CliOptions = {
   count: 3,
-  concurrency: 3,
+  concurrency: 1,
   delayMs: 0,
   proxyUrl: undefined,
   incognitoMode: true,
@@ -210,7 +249,218 @@ const DEFAULT_OPTIONS: CliOptions = {
   kiroRsPriority: toInt(process.env.KIRO_RS_PRIORITY, 0),
   kiroRsEndpoint: process.env.KIRO_RS_ENDPOINT,
   kiroRsAuthRegion: process.env.KIRO_RS_AUTH_REGION,
-  kiroRsApiRegion: process.env.KIRO_RS_API_REGION
+  kiroRsApiRegion: process.env.KIRO_RS_API_REGION,
+  autoProTrial: parseBooleanEnv(firstEnv('KIRO_AUTO_PRO_TRIAL', 'AUTO_PRO_TRIAL'), false),
+  proTxtDir: resolve(firstEnv('KIRO_PRO_TXT_DIR') || 'txt'),
+  proProfileDir: resolve(firstEnv('KIRO_PRO_PROFILE_DIR') || '.browser-profile/kiro-pro-trial'),
+  proResultPath: resolve(firstEnv('KIRO_PRO_RESULT_PATH') || 'show/pro-trial-result.json'),
+  proEventsPath: resolve(firstEnv('KIRO_PRO_EVENTS_PATH') || 'artifacts/pro-trial-events.ndjson'),
+  proReuseProfile: parseBooleanEnv(process.env.KIRO_PRO_REUSE_PROFILE, false)
+}
+
+
+function publicStripeResult(result: any): Record<string, unknown> {
+  return {
+    dry_run: result.dryRun,
+    checkout_session_id: redactSecrets(result.checkoutSessionId),
+    publishable_key: redactSecrets(result.publishableKey),
+    merchant: result.merchant,
+    currency: result.currency,
+    total_cents: result.totalCents,
+    total_text: result.totalText,
+    amount_detected: result.amountDetected,
+    payment_status: result.paymentStatus,
+    checkout_status: result.checkoutStatus,
+    setup_intent_status: result.setupIntentStatus,
+    payment_intent_status: result.paymentIntentStatus,
+    submission_state: result.submissionState,
+    next_action_type: result.nextActionType,
+    failure_reason: result.failureReason,
+    needs_manual_3ds: result.needsManual3DS,
+    trial_eligible: result.trialEligible,
+    eligibility_only: result.eligibilityOnly,
+    checkout_url: redactSecrets(result.checkoutUrl || '')
+  }
+}
+
+async function detectProTrialEligibility(
+  opts: CliOptions,
+  taskLog: (message: string) => void,
+  taskEmail?: string,
+  taskPassword?: string,
+  browserSession?: RegistrationBrowserSession
+): Promise<{
+  checked: boolean
+  success: boolean
+  trialEligible?: boolean
+  totalCents?: number
+  totalText?: string
+  error?: string
+}> {
+  const startedAt = Date.now()
+  const logger = createEventLogger(opts.proEventsPath)
+  let kiro: KiroClient | null = null
+  let selectedAccount: { path: string; lineIndex: number } | null = null
+
+  try {
+    taskLog('开始检测 Kiro PRO 试用资格（只看 checkout 金额，不提交付款）')
+    await logger.info(`读取 PRO 检测输入资料: ${opts.proTxtDir}`)
+    const input = await loadSubscribeInput(opts.proTxtDir, { email: taskEmail, password: taskPassword, eligibilityOnly: true })
+    if (input.account) {
+      selectedAccount = { path: input.accountPoolPath, lineIndex: input.account.lineIndex }
+      await updateAccountStatus(input.accountPoolPath, input.account.lineIndex, '试用检测中')
+    }
+    await logger.event('pro_trial.input_loaded', {
+      account_line: input.account ? input.account.lineIndex + 1 : undefined,
+      email: input.email,
+      card: 'not_required_for_eligibility'
+    })
+
+    kiro = new KiroClient({
+      profileDir: opts.proProfileDir,
+      headless: opts.headless,
+      logger,
+      freshProfile: browserSession ? false : !opts.proReuseProfile,
+      artifactDir: `${resolve('.')}/artifacts`,
+      credentials: { email: input.email, password: input.password, recoveryEmail: input.recoveryEmail },
+      existingContext: browserSession?.context,
+      existingPage: browserSession?.page,
+      closeExistingContext: false
+    })
+
+    const session = await kiro.ensureSession()
+    await logger.info('已取得 Kiro profileArn', { profileArn: session.profileArn })
+    const subscriptionState = readSubscriptionState(session.usage)
+    await logger.event('kiro.subscription_state', subscriptionState)
+
+    if (subscriptionState.isPaid) {
+      const result = {
+        success: true,
+        mode: 'pro_trial_eligibility_check',
+        already_subscribed: true,
+        trial_eligible: false,
+        stopped_before_payment: true,
+        reason: 'already_subscribed',
+        started_at: new Date(startedAt).toISOString(),
+        finished_at: new Date().toISOString(),
+        elapsed_ms: Date.now() - startedAt,
+        account: maskEmail(input.email),
+        account_line: input.account ? input.account.lineIndex + 1 : undefined,
+        profile_arn: session.profileArn,
+        subscription: subscriptionState,
+        events_path: opts.proEventsPath
+      }
+      await saveJson(opts.proResultPath, result)
+      if (input.account) await updateAccountStatus(input.accountPoolPath, input.account.lineIndex, '已是PRO')
+      taskLog('账号已是 PRO/付费状态，已停止')
+      return { checked: true, success: true, trialEligible: false }
+    }
+
+    const checkout = await kiro.generateSubscriptionManagementUrl(session.profileArn)
+    const checkoutSessionId = extractCheckoutSessionId(checkout.checkoutUrl)
+    if (!checkoutSessionId) throw new Error(`无法从 checkout URL 提取 checkout_session_id: ${checkout.checkoutUrl}`)
+    await logger.info('已提取 Stripe checkout_session_id', { checkoutSessionId })
+
+    const publishableKey = await kiro.discoverStripePublishableKey(checkout.checkoutUrl, checkoutSessionId)
+    await logger.info('已从 Stripe checkout 浏览器链路捕获 publishable_key', { publishableKey })
+
+    const stripeResult = await runStripeCheckout({
+      checkoutSessionId,
+      publishableKey,
+      checkoutUrl: checkout.checkoutUrl,
+      profile: input.profile,
+      eligibilityOnly: true,
+      maxTotalCents: Number.MAX_SAFE_INTEGER,
+      referrerHost: 'app.kiro.dev',
+      referrer: 'https://app.kiro.dev',
+      artifactDir: `${resolve('.')}/artifacts`,
+      logger
+    })
+    await logger.event('stripe.result', publicStripeResult(stripeResult))
+
+    const trialEligible = stripeResult.trialEligible === true
+    const result = {
+      success: trialEligible,
+      mode: 'pro_trial_eligibility_check',
+      auto_pro_trial: true,
+      trial_eligible: trialEligible,
+      stopped_before_payment: true,
+      reason: trialEligible ? 'checkout_total_is_zero' : stripeResult.amountDetected === false ? 'checkout_total_unknown' : 'checkout_total_is_not_zero',
+      started_at: new Date(startedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      elapsed_ms: Date.now() - startedAt,
+      account: maskEmail(input.email),
+      account_line: input.account ? input.account.lineIndex + 1 : undefined,
+      profile_arn: session.profileArn,
+      subscription_type: checkout.subscriptionType,
+      stripe: publicStripeResult(stripeResult),
+      events_path: opts.proEventsPath
+    }
+    await saveJson(opts.proResultPath, result)
+    if (input.account) {
+      const status = trialEligible ? '试用资格:金额0' : `无试用资格:${stripeResult.totalText || `${stripeResult.totalCents} cents`}`
+      await updateAccountStatus(input.accountPoolPath, input.account.lineIndex, status)
+    }
+    taskLog(trialEligible
+      ? `✓ 检测到 PRO 试用资格：付款金额为 0，结果已保存 ${opts.proResultPath}`
+      : `✗ 未检测到 PRO 试用资格：付款金额 ${stripeResult.totalText || stripeResult.totalCents}，结果已保存 ${opts.proResultPath}`)
+    return { checked: true, success: trialEligible, trialEligible, totalCents: stripeResult.totalCents, totalText: stripeResult.totalText }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    const lockedByKiro = /suspended|temporarily suspended|unusual user activity|account.*locked|账号不可用|临时锁定|authentication error|authentication failed/i.test(message)
+    await logger.error(message).catch(() => undefined)
+    if (selectedAccount) {
+      await updateAccountStatus(selectedAccount.path, selectedAccount.lineIndex, lockedByKiro ? 'Kiro锁号/无资格' : `失败:${redactSecrets(message).slice(0, 80)}`).catch(() => undefined)
+    }
+    await saveJson(opts.proResultPath, {
+      success: false,
+      mode: 'pro_trial_eligibility_check',
+      trial_eligible: false,
+      stopped_before_payment: true,
+      reason: lockedByKiro ? 'kiro_account_suspended' : 'pro_trial_check_failed',
+      error: redactSecrets(message),
+      started_at: new Date(startedAt).toISOString(),
+      finished_at: new Date().toISOString(),
+      events_path: opts.proEventsPath
+    }).catch(() => undefined)
+    taskLog(lockedByKiro
+      ? `PRO 试用资格检测结束：账号被 Kiro 临时锁定，无试用资格结果。${redactSecrets(message)}`
+      : `PRO 试用资格检测失败: ${redactSecrets(message)}`)
+    return { checked: true, success: false, trialEligible: false, error: redactSecrets(message) }
+  } finally {
+    await kiro?.close().catch(() => undefined)
+  }
+}
+
+async function detectProTrialEligibilityWithFallback(
+  opts: CliOptions,
+  taskLog: (message: string) => void,
+  taskEmail?: string,
+  taskPassword?: string,
+  browserSession?: RegistrationBrowserSession
+): Promise<{
+  checked: boolean
+  success: boolean
+  trialEligible?: boolean
+  totalCents?: number
+  totalText?: string
+  error?: string
+}> {
+  const primary = await detectProTrialEligibility(opts, taskLog, taskEmail, taskPassword, browserSession)
+  if (primary.success || !browserSession) return primary
+  if (/suspended|temporarily suspended|unusual user activity|account.*locked|账号不可用|临时锁定/i.test(primary.error || '')) {
+    taskLog(`当前账号 Kiro 不可用/被临时锁定，不再兜底重试: ${primary.error}`)
+    return primary
+  }
+  taskLog(`当前注册浏览器检测失败，兜底使用专用 Kiro profile 重试一次: ${primary.error || 'unknown'}`)
+  return detectProTrialEligibility(opts, taskLog, taskEmail, taskPassword)
+}
+
+async function saveJson(path: string, data: unknown): Promise<void> {
+  const { mkdir, writeFile } = await import('node:fs/promises')
+  const { dirname } = await import('node:path')
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify(data, null, 2), 'utf8')
 }
 
 async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: number }> {
@@ -245,6 +495,10 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
     name?: string
     uploadedToKiroRs?: boolean
     kiroRsCredentialId?: number
+    proTrialChecked?: boolean
+    proTrialEligible?: boolean
+    proTrialTotalCents?: number
+    proTrialTotalText?: string
     success: boolean
     error?: string
   }> = new Array(total).fill(null)
@@ -288,13 +542,30 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
         userCode: start.userCode,
         verificationUri: start.verificationUri,
         useFingerprint: opts.useFingerprint,
-        headless: opts.headless
+        headless: opts.headless,
+        keepBrowserOpen: opts.autoProTrial
       })
 
       let uploadedToKiroRs = false
       let kiroRsCredentialId: number | undefined
 
-      if (result.success) {
+      let proTrialChecked = false
+      let proTrialEligible: boolean | undefined
+      let proTrialTotalCents: number | undefined
+      let proTrialTotalText: string | undefined
+      let proTrialError: string | undefined
+      let taskSuccess = result.success
+
+      if (result.success && opts.autoProTrial) {
+        log('PRO 试用检测已开启：当前流程只执行 注册 -> 检测资格，然后停止；不会付款，也不会发布到 kiro.rs')
+        const proTrial = await detectProTrialEligibilityWithFallback(opts, log, result.email, result.password, result.browserSession)
+        proTrialChecked = proTrial.checked
+        proTrialEligible = proTrial.trialEligible
+        proTrialTotalCents = proTrial.totalCents
+        proTrialTotalText = proTrial.totalText
+        proTrialError = proTrial.error
+        taskSuccess = proTrial.success
+      } else if (result.success) {
         const endAt = start.expiresAt
         let intervalMs = Math.max(1000, start.interval * 1000)
         let refreshToken: string | undefined
@@ -366,16 +637,29 @@ async function runRegistration(opts: CliOptions): Promise<{ ok: number; fail: nu
         name: result.name,
         uploadedToKiroRs,
         kiroRsCredentialId,
-        success: result.success,
-        error: result.error
+        proTrialChecked,
+        proTrialEligible,
+        proTrialTotalCents,
+        proTrialTotalText,
+        success: taskSuccess,
+        error: result.error || proTrialError
       }
 
       completed++
-      if (result.success) {
+      if (result.success && opts.autoProTrial) {
+        if (taskSuccess && proTrialEligible === true) {
+          log(`✅ 注册完成，PRO 试用资格确认：金额 0。邮箱: ${result.email}`)
+        } else if (proTrialChecked) {
+          log(`⚠️ 注册完成，但 PRO 试用资格未通过/检测失败: ${proTrialError || proTrialTotalText || '未检测到金额 0'}`)
+        } else {
+          log(`⚠️ 注册完成，但 PRO 试用资格未检测完成`)
+        }
+      } else if (result.success) {
         log(`✅ 拿下！邮箱: ${result.email}！AWS 又损失一员大将！`)
       } else {
         log(`❌ 翻车了: ${result.error}...AWS 这波防住了`)
       }
+      await result.browserSession?.close().catch(() => undefined)
     } catch (e) {
       completed++
       allRecords[idx] = {
@@ -448,7 +732,8 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
     log('dim', `│ 隐身模式: ${currentOptions.incognitoMode ? '✅ 开着呢' : '❌ 关了'}`)
     log('dim', `│ 指纹伪装: ${currentOptions.useFingerprint ? '✅ 伪装中' : '❌ 原始状态'}`)
     log('dim', `│ 浏览器显示: ${currentOptions.headless ? '❌ 后台运行' : '✅ 前台可见'}`)
-    log('dim', `│ 发布 kiro.rs: ${currentOptions.publishKiroRs ? '✅ 自动发布' : '❌ 不发布'}`)
+    log('dim', `│ 发布 kiro.rs: ${currentOptions.autoProTrial ? '⏸ PRO检测开启，暂不发布' : currentOptions.publishKiroRs ? '✅ 自动发布' : '❌ 不发布'}`)
+    log('dim', `│ PRO试用资格检测: ${currentOptions.autoProTrial ? '✅ 开启（检测后停止）' : '❌ 不检测'}`)
     if (currentOptions.proxyUrl) {
       log('dim', `│ 走代理: ${currentOptions.proxyUrl}`)
     } else {
@@ -465,7 +750,8 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
     print(COLORS.cyan + '│' + COLORS.reset + '  [6] 切换指纹伪装')
     print(COLORS.cyan + '│' + COLORS.reset + '  [7] 切换浏览器显示')
     print(COLORS.cyan + '│' + COLORS.reset + '  [8] 切换是否发布 kiro.rs')
-    print(COLORS.cyan + '│' + COLORS.reset + '  [9] 设置代理')
+    print(COLORS.cyan + '│' + COLORS.reset + '  [9] 切换PRO试用资格检测')
+    print(COLORS.cyan + '│' + COLORS.reset + '  [10] 设置代理')
     print(COLORS.cyan + '│' + COLORS.reset + '  [0] 退出 (不玩了)')
     log('cyan', '└─────────────────────────────────────────────')
     print('')
@@ -475,7 +761,7 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
   await showMenu()
 
   while (running) {
-    const input = await question(COLORS.green + '选个数字 [0-9] > ' + COLORS.reset)
+    const input = await question(COLORS.green + '选个数字 [0-10] > ' + COLORS.reset)
     const cmd = input.trim()
 
     switch (cmd) {
@@ -578,6 +864,16 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
       }
 
       case '9': {
+        currentOptions.autoProTrial = !currentOptions.autoProTrial
+        if (currentOptions.autoProTrial) {
+          log('green', '✓ 注册成功后只检测 PRO 试用资格；检测完立刻停止，不付款、不发布 kiro.rs')
+        } else {
+          log('yellow', '⚠️ 已关闭 PRO 试用资格检测；注册成功后按原逻辑发布 kiro.rs')
+        }
+        break
+      }
+
+      case '10': {
         const current = currentOptions.proxyUrl || '无'
         const answer = await question(`代理地址 (留空清除) [当前: ${current}]: `)
         if (answer.trim() === '') {
@@ -601,11 +897,11 @@ async function interactiveMode(initialOptions: Partial<CliOptions>): Promise<voi
         break
 
       default:
-        log('yellow', `输入 "${input}" 是啥意思？请输入 0-9`)
+        log('yellow', `输入 "${input}" 是啥意思？请输入 0-10`)
         break
     }
 
-    if (running && cmd !== '9') {
+    if (running && cmd !== '10') {
       print('')
       await showMenu()
     }
@@ -622,14 +918,14 @@ async function main() {
 
   if (testMailProvider) {
     const opts: CliOptions = { ...DEFAULT_OPTIONS, ...cliArgs }
-    log('cyan', '正在自测 Cloudflare Temp Email')
+    log('cyan', '正在自测临时邮箱渠道')
     const result = await createTempMail((message) => log('dim', message), 15)
     if (!result) {
-      log('red', '✗ Cloudflare Temp Email 自测失败')
+      log('red', '✗ 临时邮箱渠道自测失败')
       process.exitCode = 1
       return
     }
-    log('green', `✓ Cloudflare Temp Email 自测成功: ${result.email}`)
+    log('green', `✓ 临时邮箱渠道自测成功: ${result.email}`)
     return
   }
 

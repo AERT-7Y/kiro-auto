@@ -1,9 +1,26 @@
-import { chromium, Browser, Page } from 'playwright'
+import { chromium, Browser, Page, type BrowserContext } from 'playwright'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 type LogCallback = (message: string) => void
+export type RegistrationBrowserSession = {
+  browser: Browser
+  context: BrowserContext
+  page: Page
+  close: () => Promise<void>
+}
+
+export type RegisterAwsResult = {
+  success: boolean
+  ssoToken?: string
+  name?: string
+  error?: string
+  email?: string
+  password?: string
+  browserSession?: RegistrationBrowserSession
+}
+
 type TempMailMessage = {
   id?: string
   from: string
@@ -19,6 +36,18 @@ type CloudflareTempEmailConfig = {
   customAuth: string
   domain: string
   useRandomSubdomain: boolean
+  mode: 'random' | 'pool'
+  poolPath: string
+  poolReceiver: string
+}
+
+export type TempMailProvider = 'cloudflare-temp-email' | 'gptmail'
+
+type GPTMailConfig = {
+  baseUrl: string
+  apiKey: string
+  domain: string
+  prefix: string
 }
 
 const CODE_PATTERNS = [
@@ -97,8 +126,23 @@ function generateAliasLocalPart(): string {
   return chars.join('')
 }
 
-function normalizeCloudflareTempEmailBaseUrl(rawValue = ''): string {
-  const value = String(rawValue || '').trim()
+function normalizeEmailAddress(rawValue = ''): string {
+  const value = String(rawValue || '').trim().toLowerCase()
+  return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(value) ? value : ''
+}
+
+function normalizeTempMailProvider(rawValue = ''): TempMailProvider {
+  const value = String(rawValue || '').trim().toLowerCase()
+  if (/^(gptmail|gpt-mail|chatgpt-mail|chatgpt_mail|mail.chatgpt.org.uk)$/i.test(value)) return 'gptmail'
+  return 'cloudflare-temp-email'
+}
+
+function getTempMailProvider(): TempMailProvider {
+  return normalizeTempMailProvider(process.env.TEMP_MAIL_PROVIDER || process.env.MAIL_PROVIDER || process.env.EMAIL_PROVIDER)
+}
+
+function normalizeHttpBaseUrl(rawValue = '', fallback = ''): string {
+  const value = String(rawValue || fallback || '').trim()
   if (!value) return ''
 
   const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(value) ? value : `https://${value}`
@@ -111,6 +155,39 @@ function normalizeCloudflareTempEmailBaseUrl(rawValue = ''): string {
   } catch {
     return ''
   }
+}
+
+function joinApiUrl(baseUrl: string, path: string): string {
+  const normalizedBase = normalizeHttpBaseUrl(baseUrl)
+  const normalizedPath = String(path || '').trim()
+  if (!normalizedBase || !normalizedPath) return normalizedBase || ''
+  return `${normalizedBase}${normalizedPath.startsWith('/') ? '' : '/'}${normalizedPath}`
+}
+
+function normalizeCloudflareTempEmailMode(rawValue = ''): 'random' | 'pool' {
+  const value = String(rawValue || '').trim().toLowerCase()
+  if (/^(pool|email_pool|mail_pool|txt|file|邮箱池)$/i.test(value)) return 'pool'
+  return 'random'
+}
+
+function getCloudflareTempEmailPoolPath(rawValue = ''): string {
+  const value = String(rawValue || '').trim()
+  return value ? resolve(value) : resolve(PROJECT_ROOT, 'txt', 'cloudflare-temp-email-pool.txt')
+}
+
+async function pickCloudflareTempEmailFromPool(poolPath: string): Promise<string> {
+  const { readFile } = await import('node:fs/promises')
+  const raw = await readFile(poolPath, 'utf8')
+  const emails = raw
+    .split(/\r?\n/)
+    .map((line) => normalizeEmailAddress(line.replace(/#.*/, '')))
+    .filter(Boolean)
+  if (!emails.length) throw new Error(`邮箱池为空或格式不正确: ${poolPath}`)
+  return emails[Math.floor(Math.random() * emails.length)]!
+}
+
+function normalizeCloudflareTempEmailBaseUrl(rawValue = ''): string {
+  return normalizeHttpBaseUrl(rawValue)
 }
 
 function normalizeCloudflareTempEmailDomain(rawValue = ''): string {
@@ -133,7 +210,10 @@ function getCloudflareTempEmailConfig(): CloudflareTempEmailConfig {
     adminAuth: String(process.env.CLOUDFLARE_TEMP_EMAIL_ADMIN_AUTH || ''),
     customAuth: String(process.env.CLOUDFLARE_TEMP_EMAIL_CUSTOM_AUTH || ''),
     domain: normalizeCloudflareTempEmailDomain(process.env.CLOUDFLARE_TEMP_EMAIL_DOMAIN),
-    useRandomSubdomain: parseBooleanEnv(process.env.CLOUDFLARE_TEMP_EMAIL_USE_RANDOM_SUBDOMAIN)
+    useRandomSubdomain: parseBooleanEnv(process.env.CLOUDFLARE_TEMP_EMAIL_USE_RANDOM_SUBDOMAIN),
+    mode: normalizeCloudflareTempEmailMode(process.env.CLOUDFLARE_TEMP_EMAIL_MODE),
+    poolPath: getCloudflareTempEmailPoolPath(process.env.CLOUDFLARE_TEMP_EMAIL_POOL_PATH),
+    poolReceiver: normalizeEmailAddress(process.env.CLOUDFLARE_TEMP_EMAIL_POOL_RECEIVER || '')
   }
 }
 
@@ -146,10 +226,7 @@ function buildCloudflareTempEmailHeaders(config: CloudflareTempEmailConfig, json
 }
 
 function joinCloudflareTempEmailUrl(baseUrl: string, path: string): string {
-  const normalizedBase = normalizeCloudflareTempEmailBaseUrl(baseUrl)
-  const normalizedPath = String(path || '').trim()
-  if (!normalizedBase || !normalizedPath) return normalizedBase || ''
-  return `${normalizedBase}${normalizedPath.startsWith('/') ? '' : '/'}${normalizedPath}`
+  return joinApiUrl(baseUrl, path)
 }
 
 function getCloudflareTempEmailMailRows(payload: unknown): any[] {
@@ -244,6 +321,262 @@ async function requestCloudflareTempEmailJson(
   } finally {
     clearTimeout(timeoutId)
   }
+}
+
+function getGPTMailConfig(): GPTMailConfig {
+  return {
+    baseUrl: normalizeHttpBaseUrl(process.env.GPTMAIL_BASE_URL || process.env.CHATGPT_MAIL_BASE_URL, 'https://mail.chatgpt.org.uk'),
+    apiKey: String(process.env.GPTMAIL_API_KEY || process.env.CHATGPT_MAIL_API_KEY || '').trim(),
+    domain: normalizeCloudflareTempEmailDomain(process.env.GPTMAIL_DOMAIN || process.env.CHATGPT_MAIL_DOMAIN),
+    prefix: String(process.env.GPTMAIL_PREFIX || process.env.CHATGPT_MAIL_PREFIX || '').trim()
+  }
+}
+
+function buildGPTMailHeaders(config: GPTMailConfig): Record<string, string> {
+  return {
+    Accept: 'application/json',
+    'X-API-Key': config.apiKey
+  }
+}
+
+function getGPTMailRows(payload: unknown): any[] {
+  if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== 'object') return []
+
+  const obj = payload as Record<string, any>
+  const candidates = [obj.emails, obj.data?.emails, obj.data, obj.items, obj.messages, obj.mails, obj.results, obj.rows]
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate
+  }
+  return []
+}
+
+function getGPTMailAddressFromResponse(payload: any): string {
+  return normalizeEmailAddress(firstNonEmptyString([
+    payload?.email,
+    payload?.data?.email,
+    payload?.address,
+    payload?.data?.address
+  ]))
+}
+
+function normalizeGPTMailMessage(row: any): TempMailMessage | null {
+  if (!row || typeof row !== 'object') return null
+
+  const from = firstNonEmptyString([
+    row.from?.emailAddress?.address,
+    row.from?.address,
+    row.from_address,
+    row.from,
+    row.sender,
+    row.mail_from
+  ])
+  const subject = firstNonEmptyString([row.subject, row.title])
+  const text = firstNonEmptyString([row.text, row.content, row.body, row.bodyText, row.plain, row.preview, row.bodyPreview])
+  const html = firstNonEmptyString([row.html, row.html_content, row.htmlBody, row.bodyHtml])
+
+  return {
+    id: firstNonEmptyString([row.id, row.emailId, row.mail_id, row.messageId, row.receivedAt, row.createdAt, row.timestamp]),
+    from,
+    subject,
+    body: text,
+    html,
+    text
+  }
+}
+
+async function requestGPTMailJson(
+  config: GPTMailConfig,
+  path: string,
+  options: { method?: string; payload?: unknown; searchParams?: Record<string, unknown>; timeoutMs?: number } = {}
+): Promise<any> {
+  const method = options.method || 'GET'
+  const timeoutMs = options.timeoutMs || 20000
+  const url = new URL(joinApiUrl(config.baseUrl, path))
+
+  for (const [key, value] of Object.entries(options.searchParams || {})) {
+    if (value === undefined || value === null || value === '') continue
+    url.searchParams.set(key, String(value))
+  }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const headers = buildGPTMailHeaders(config)
+    if (options.payload !== undefined) headers['Content-Type'] = 'application/json'
+    const response = await fetch(url.toString(), {
+      method,
+      headers,
+      body: options.payload !== undefined ? JSON.stringify(options.payload) : undefined,
+      signal: controller.signal
+    })
+    const text = await response.text()
+    let parsed: any = {}
+    try {
+      parsed = text ? JSON.parse(text) : {}
+    } catch {
+      parsed = text
+    }
+
+    if (!response.ok) {
+      const payloadError = parsed && typeof parsed === 'object'
+        ? (parsed.message || parsed.error || parsed.msg)
+        : ''
+      throw new Error(payloadError || text || `HTTP ${response.status}`)
+    }
+
+    if (parsed && typeof parsed === 'object' && parsed.success === false) {
+      throw new Error(firstNonEmptyString([parsed.message, parsed.error, parsed.msg]) || 'API 返回 success=false')
+    }
+
+    return parsed
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(message === 'This operation was aborted'
+      ? `GPTMail 请求超时（>${Math.round(timeoutMs / 1000)} 秒）`
+      : `GPTMail 请求失败：${message}`)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function createGPTMail(
+  log: LogCallback,
+  timeout: number = 30
+): Promise<{ email: string; token: string; password?: string } | null> {
+  const config = getGPTMailConfig()
+  if (!config.baseUrl || !config.apiKey) {
+    log('⚠ GPTMail 配置不完整，必须设置 GPTMAIL_API_KEY；GPTMAIL_BASE_URL 默认 https://mail.chatgpt.org.uk')
+    return null
+  }
+
+  const maxAttempts = 3
+  const startTime = Date.now()
+  let attemptCount = 0
+  log('========== 使用 GPTMail 创建临时邮箱 ==========')
+
+  while (Date.now() - startTime < timeout * 1000 && attemptCount < maxAttempts) {
+    attemptCount++
+    try {
+      log(`  第 ${attemptCount}/${maxAttempts} 次创建邮箱`)
+      const usePost = Boolean(config.domain || config.prefix)
+      const result = await requestGPTMailJson(config, '/api/generate-email', usePost
+        ? {
+            method: 'POST',
+            payload: {
+              domain: config.domain || undefined,
+              prefix: config.prefix || undefined
+            }
+          }
+        : {})
+      const address = getGPTMailAddressFromResponse(result)
+      if (address) {
+        const password = Math.random().toString(36).slice(-8) + 'A1!'
+        log(`✓ 成功获取 GPTMail 临时邮箱: ${address}`)
+        return { email: address, token: `gptmail:${address}`, password }
+      }
+
+      log(`  API 返回格式错误: ${JSON.stringify(result)}`)
+    } catch (error) {
+      log(`GPTMail 第 ${attemptCount} 次申请失败: ${error}`)
+    }
+
+    if (attemptCount < maxAttempts) {
+      await new Promise(r => setTimeout(r, 500))
+    }
+  }
+
+  log('✗ GPTMail 创建邮箱失败')
+  return null
+}
+
+async function getGPTMailCode(
+  token: string,
+  email: string,
+  log: LogCallback,
+  timeout: number = 120,
+  ignoreCodes: string[] = []
+): Promise<string | null> {
+  const config = getGPTMailConfig()
+  if (!config.baseUrl || !config.apiKey) {
+    log('GPTMail 配置不完整，无法轮询邮件')
+    return null
+  }
+
+  const tokenAddress = token.startsWith('gptmail:')
+    ? normalizeEmailAddress(token.slice('gptmail:'.length))
+    : ''
+  const queryAddress = tokenAddress || email
+
+  log(`========== 开始等待 GPTMail ${queryAddress} 收到 AWS 验证码 ==========`)
+  if (queryAddress !== email) {
+    log(`注册邮箱: ${email}`)
+    log(`查信邮箱: ${queryAddress}`)
+  }
+
+  const startTime = Date.now()
+  const checkInterval = 3000
+  const seenIds = new Set<string>()
+  const ignored = new Set(ignoreCodes.filter(Boolean))
+  let lastError = ''
+
+  while (Date.now() - startTime < timeout * 1000) {
+    try {
+      const payload = await requestGPTMailJson(config, '/api/emails', {
+        searchParams: { email: queryAddress }
+      })
+      const messages = getGPTMailRows(payload)
+        .map((row) => normalizeGPTMailMessage(row))
+        .filter((message): message is TempMailMessage => Boolean(message))
+
+      if (!messages || messages.length === 0) {
+        await new Promise(r => setTimeout(r, checkInterval))
+        continue
+      }
+
+      for (const msg of messages) {
+        const content = `${msg.body || ''}
+${msg.html || ''}
+${msg.text || ''}`
+        const msgHash = msg.id || `${msg.subject?.substring(0, 20)}_${content.length}`
+        if (seenIds.has(msgHash)) continue
+        seenIds.add(msgHash)
+
+        const sender = (msg.from || '').toLowerCase()
+        const subject = (msg.subject || '').toLowerCase()
+        const isAwsSender = AWS_SENDERS.some(s => sender.includes(s.toLowerCase()))
+        if (!isAwsSender && !subject.includes('aws') && !subject.includes('amazon') && !content.toLowerCase().includes('aws')) {
+          continue
+        }
+
+        log(`\n=== 收到新邮件 ===`)
+        log(`  发件人: ${sender}`)
+        log(`  主题: ${subject}`)
+
+        const bodyText = htmlToText(msg.html || '') || msg.body || ''
+        const code = extractCode(subject) || extractCode(bodyText) || extractCode(content)
+        if (code) {
+          if (ignored.has(code)) {
+            log(`跳过已失效验证码: ${code}`)
+            continue
+          }
+          log(`\n========== 找到验证码: ${code} ==========`)
+          return code
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message !== lastError) {
+        lastError = message
+        log(`GPTMail 获取验证码出错: ${message}`)
+      }
+    }
+
+    await new Promise(r => setTimeout(r, checkInterval))
+  }
+
+  log('✗ GPTMail 获取验证码超时')
+  return null
 }
 
 function generateRandomName(): string {
@@ -357,6 +690,168 @@ async function simulatePreRegistrationBehavior(page: Page, log: LogCallback): Pr
   log('[反检测] ✓ 预热行为完成')
 }
 
+async function getAwsVerificationCode(
+  useTempMail: boolean,
+  tempMailToken: string,
+  email: string,
+  log: LogCallback,
+  refreshToken?: string,
+  clientId?: string,
+  timeout: number = 120,
+  ignoreCodes: string[] = []
+): Promise<string | null> {
+  if (useTempMail) {
+    return getTempMailCode(tempMailToken, email, log, timeout, ignoreCodes)
+  }
+  if (refreshToken && clientId) {
+    return getOutlookVerificationCode(refreshToken, clientId, log, timeout, ignoreCodes)
+  }
+  log('缺少 refresh_token 或 client_id，无法自动获取验证码')
+  return null
+}
+
+async function readAwsVerificationError(page: Page): Promise<string> {
+  const selectors = [
+    '[role="alert"]',
+    '.awsui-alert',
+    'div[class*="awsui_content_"]',
+    'div[class*="awsui_error"]',
+    'span[class*="awsui_error"]',
+    'text=/invalid code|request a new code|code is incorrect|验证码|验证代码/i',
+  ]
+  const chunks: string[] = []
+  for (const selector of selectors) {
+    const text = await page.locator(selector).first().innerText({ timeout: 800 }).catch(() => '')
+    if (text && !chunks.includes(text)) chunks.push(text)
+  }
+  const body = await page.locator('body').innerText({ timeout: 1200 }).catch(() => '')
+  if (body) chunks.push(body)
+  return chunks.join('\n').slice(0, 3000)
+}
+
+function isAwsVerificationCodeExhausted(text: string): boolean {
+  return /invalid code too many times|request a new code|validate with an invalid code too many times|it's not you[,，]?\s*it's us|we couldn['’]?t complete your request|we could not complete your request|we're working|we are working|验证码.*次数.*过多|重新.*验证码/i.test(text)
+}
+
+function isAwsVerificationCodeInvalid(text: string): boolean {
+  return isAwsVerificationCodeExhausted(text) || /invalid code|incorrect code|code is incorrect|couldn['’]?t complete your request|could not complete your request|验证码.*错误|验证码.*无效|验证代码.*错误/i.test(text)
+}
+
+async function requestNewAwsVerificationCode(page: Page, log: LogCallback): Promise<boolean> {
+  const dismissSelectors = [
+    'button[aria-label="Dismiss error message modal"]',
+    'button[aria-label="Close"]',
+    'button[aria-label="关闭"]',
+    'button:has-text("Dismiss")',
+    'button:has-text("Close")',
+    'button:has-text("关闭")',
+  ]
+  for (const selector of dismissSelectors) {
+    const target = page.locator(selector).first()
+    if (!(await target.isVisible({ timeout: 700 }).catch(() => false))) continue
+    await target.click({ timeout: 3000 }).catch(() => undefined)
+    log(`✓ 已关闭验证码错误提示: ${selector}`)
+    await page.waitForTimeout(1000)
+    break
+  }
+
+  const selectors = [
+    'button:has-text("Request a new code")',
+    'button:has-text("Resend code")',
+    'button:has-text("Send new code")',
+    'button:has-text("Get a new code")',
+    'a:has-text("Request a new code")',
+    'a:has-text("Resend code")',
+    'a:has-text("Send new code")',
+    'a:has-text("Get a new code")',
+    'button:has-text("重新发送")',
+    'button:has-text("重新获取")',
+    'button:has-text("获取新验证码")',
+    'a:has-text("重新发送")',
+    'a:has-text("重新获取")',
+    'a:has-text("获取新验证码")',
+  ]
+  for (const selector of selectors) {
+    const target = page.locator(selector).first()
+    if (!(await target.isVisible({ timeout: 1000 }).catch(() => false))) continue
+    await target.click({ timeout: 5000 }).catch(() => undefined)
+    log(`✓ 已请求新的验证码: ${selector}`)
+    await page.waitForTimeout(3000)
+    return true
+  }
+  log('⚠ 未找到请求新验证码按钮，等待页面自动重新发码/重试')
+  await page.waitForTimeout(5000)
+  return false
+}
+
+async function replaceVerificationCode(page: Page, selector: string, code: string, log: LogCallback, description: string): Promise<boolean> {
+  const input = page.locator(selector).first()
+  await input.waitFor({ state: 'visible', timeout: 10000 })
+  await input.click({ timeout: 5000 }).catch(() => undefined)
+  await input.fill('', { timeout: 5000 }).catch(() => undefined)
+  return waitAndFill(page, selector, code, log, description, 10000)
+}
+
+async function submitAwsVerificationCodeWithRecovery(options: {
+  page: Page
+  codeInputSelector: string
+  submitSelector: string
+  getCode: (ignoreCodes: string[]) => Promise<string | null>
+  log: LogCallback
+  inputDescription: string
+  submitDescription: string
+  successSelector?: string
+  maxNewCodeAttempts?: number
+}): Promise<boolean> {
+  const usedCodes: string[] = []
+  const maxAttempts = options.maxNewCodeAttempts ?? 3
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    options.log(`开始接收${options.inputDescription}（第 ${attempt}/${maxAttempts} 次）...`)
+    const code = await options.getCode(usedCodes)
+    if (!code) throw new Error(`无法获取${options.inputDescription}`)
+    usedCodes.push(code)
+    options.log(`✓ 已获取${options.inputDescription}，准备填写提交`)
+
+    if (!await replaceVerificationCode(options.page, options.codeInputSelector, code, options.log, attempt === 1 ? options.inputDescription : `${options.inputDescription}（新码）`)) {
+      throw new Error(`输入${options.inputDescription}失败`)
+    }
+
+    await options.page.waitForTimeout(1000)
+    if (!await waitAndClickWithRetry(options.page, options.submitSelector, options.log, attempt === 1 ? options.submitDescription : `${options.submitDescription}（新码）`, 30000, 3)) {
+      throw new Error(`点击${options.submitDescription}失败`)
+    }
+
+    await options.page.waitForTimeout(3000)
+    if (options.successSelector && await options.page.locator(options.successSelector).first().isVisible({ timeout: 3000 }).catch(() => false)) {
+      options.log(`✓ 验证码通过，已进入下一步`)
+      return true
+    }
+
+    const stillOnCodePage = await options.page.locator(options.codeInputSelector).first().isVisible({ timeout: 1200 }).catch(() => false)
+    const errorText = await readAwsVerificationError(options.page)
+    if (isAwsVerificationCodeInvalid(errorText) || stillOnCodePage) {
+      options.log(`⚠ 验证码未通过${isAwsVerificationCodeExhausted(errorText) ? '，需要重新请求验证码' : ''}（第 ${attempt}/${maxAttempts} 次）`)
+      if (attempt >= maxAttempts) return false
+      if (isAwsVerificationCodeExhausted(errorText)) {
+        await requestNewAwsVerificationCode(options.page, options.log)
+      } else {
+        await options.page.waitForTimeout(4000)
+      }
+      continue
+    }
+
+    return true
+  }
+
+  return false
+}
+
+function isBrowserClosedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /target page, context or browser has been closed|browser has been closed|context.*closed|page.*closed/i.test(message)
+}
+
 function htmlToText(html: string): string {
   if (!html) return ''
   
@@ -416,7 +911,8 @@ export async function getOutlookVerificationCode(
   refreshToken: string,
   clientId: string,
   log: LogCallback,
-  timeout: number = 120
+  timeout: number = 120,
+  ignoreCodes: string[] = []
 ): Promise<string | null> {
   log('========== 开始获取邮箱验证码 ==========')
   log(`client_id: ${clientId}`)
@@ -425,6 +921,7 @@ export async function getOutlookVerificationCode(
   const startTime = Date.now()
   const checkInterval = 5000
   const checkedIds = new Set<string>()
+  const ignored = new Set(ignoreCodes.filter(Boolean))
   
   while (Date.now() - startTime < timeout * 1000) {
     try {
@@ -525,6 +1022,10 @@ export async function getOutlookVerificationCode(
           }
           
           if (code) {
+            if (ignored.has(code)) {
+              log(`跳过已失效验证码: ${code}`)
+              continue
+            }
             log(`\n========== 找到验证码: ${code} ==========`)
             return code
           }
@@ -548,16 +1049,37 @@ export async function createTempMail(
   log: LogCallback,
   timeout: number = 30
 ): Promise<{ email: string; token: string; password?: string } | null> {
+  const provider = getTempMailProvider()
+  if (provider === 'gptmail') return createGPTMail(log, timeout)
+
   const config = getCloudflareTempEmailConfig()
-  if (!config.baseUrl || !config.adminAuth || !config.domain) {
-    log('⚠ Cloudflare Temp Email 配置不完整，必须设置 CLOUDFLARE_TEMP_EMAIL_BASE_URL / CLOUDFLARE_TEMP_EMAIL_ADMIN_AUTH / CLOUDFLARE_TEMP_EMAIL_DOMAIN')
+  if (!config.baseUrl || !config.adminAuth || (config.mode === 'random' && !config.domain)) {
+    log('⚠ Cloudflare Temp Email 配置不完整，随机模式必须设置 CLOUDFLARE_TEMP_EMAIL_BASE_URL / CLOUDFLARE_TEMP_EMAIL_ADMIN_AUTH / CLOUDFLARE_TEMP_EMAIL_DOMAIN')
     return null
+  }
+
+  if (config.mode === 'pool') {
+    if (!config.poolReceiver) {
+      log('⚠ Cloudflare Temp Email 邮箱池模式必须设置 CLOUDFLARE_TEMP_EMAIL_POOL_RECEIVER')
+      return null
+    }
+    try {
+      const address = await pickCloudflareTempEmailFromPool(config.poolPath)
+      const password = Math.random().toString(36).slice(-8) + 'A1!'
+      log('========== 使用 Cloudflare Temp Email 邮箱池 ==========')
+      log(`✓ 从邮箱池选择注册邮箱: ${address}`)
+      log(`✓ 验证码固定查询接收邮箱: ${config.poolReceiver}`)
+      return { email: address, token: `cloudflare-temp-email-pool:${config.poolReceiver}`, password }
+    } catch (error) {
+      log(`✗ 读取 Cloudflare Temp Email 邮箱池失败: ${error instanceof Error ? error.message : String(error)}`)
+      return null
+    }
   }
 
   const maxAttempts = 3
   const startTime = Date.now()
   let attemptCount = 0
-  log('========== 使用 Cloudflare Temp Email 创建临时邮箱 ==========')
+  log('========== 使用 Cloudflare Temp Email 随机创建临时邮箱 ==========')
 
   while (Date.now() - startTime < timeout * 1000 && attemptCount < maxAttempts) {
     attemptCount++
@@ -600,19 +1122,36 @@ export async function getTempMailCode(
   token: string,
   email: string,
   log: LogCallback,
-  timeout: number = 120
+  timeout: number = 120,
+  ignoreCodes: string[] = []
 ): Promise<string | null> {
-  log(`========== 开始等待 Cloudflare Temp Email ${email} 收到 AWS 验证码 ==========`)
+  const provider: TempMailProvider = token.startsWith('gptmail:')
+    ? 'gptmail'
+    : token.startsWith('cloudflare-temp-email:') || token.startsWith('cloudflare-temp-email-pool:')
+      ? 'cloudflare-temp-email'
+      : getTempMailProvider()
+  if (provider === 'gptmail') return getGPTMailCode(token, email, log, timeout, ignoreCodes)
 
   const config = getCloudflareTempEmailConfig()
   if (!config.baseUrl || !config.adminAuth) {
     log('Cloudflare Temp Email 配置不完整，无法轮询邮件')
     return null
   }
+  const tokenReceiver = token.startsWith('cloudflare-temp-email-pool:')
+    ? normalizeEmailAddress(token.slice('cloudflare-temp-email-pool:'.length))
+    : ''
+  const queryAddress = tokenReceiver || (config.mode === 'pool' ? config.poolReceiver : '') || email
+
+  log(`========== 开始等待 Cloudflare Temp Email ${queryAddress} 收到 AWS 验证码 ==========`)
+  if (queryAddress !== email) {
+    log(`注册邮箱: ${email}`)
+    log(`查信邮箱: ${queryAddress}`)
+  }
 
   const startTime = Date.now()
   const checkInterval = 3000
   const seenIds = new Set<string>()
+  const ignored = new Set(ignoreCodes.filter(Boolean))
 
   while (Date.now() - startTime < timeout * 1000) {
     try {
@@ -621,7 +1160,7 @@ export async function getTempMailCode(
         searchParams: {
           limit: 20,
           offset: 0,
-          address: email
+          address: queryAddress
         }
       })
       const messages = getCloudflareTempEmailMailRows(payload)
@@ -653,6 +1192,10 @@ export async function getTempMailCode(
         const bodyText = htmlToText(msg.html || '') || msg.body || ''
         const code = extractCode(subject) || extractCode(bodyText) || extractCode(content)
         if (code) {
+          if (ignored.has(code)) {
+            log(`跳过已失效验证码: ${code}`)
+            continue
+          }
           log(`\n========== 找到验证码: ${code} ==========`)
           return code
         }
@@ -1156,8 +1699,9 @@ export async function autoRegisterAWS(
   verificationUri?: string,
   useFingerprint: boolean = true,
   fingerprintProfile?: any,
-  headless: boolean = true
-): Promise<{ success: boolean; ssoToken?: string; name?: string; error?: string; email?: string; password?: string }> {
+  headless: boolean = true,
+  keepBrowserOpen: boolean = false
+): Promise<RegisterAwsResult> {
   let tempMailToken = ''
   if (useTempMail) {
     const tempResult = await createTempMail(log, 30)
@@ -1177,6 +1721,8 @@ export async function autoRegisterAWS(
   const password = emailPassword || 'admin123456aA!'
   const randomName = generateRandomName()
   let browser: Browser | null = null
+  let context: BrowserContext | null = null
+  let page: Page | null = null
   
   log('========== 开始自动注册 AWS Builder ID ==========')
   log(`无痕模式: ${incognitoMode ? '已启用' : '已禁用'}`)
@@ -1254,8 +1800,8 @@ export async function autoRegisterAWS(
       contextOptions.ignoreHTTPSErrors = false
     }
     
-    const context = await browser.newContext(contextOptions)
-    const page = await context.newPage()
+    context = await browser.newContext(contextOptions)
+    page = await context.newPage()
     
     if (useFingerprint && profile) {
       log('[指纹] 注入高级指纹脚本...')
@@ -1383,30 +1929,19 @@ export async function autoRegisterAWS(
         throw new Error('未找到登录验证码输入框')
       }
       
-      await page.waitForTimeout(1000)
-      
-      let loginVerificationCode: string | null = null
-      if (useTempMail) {
-        loginVerificationCode = await getTempMailCode(tempMailToken, email, log, 120)
-      } else if (refreshToken && clientId) {
-        loginVerificationCode = await getOutlookVerificationCode(refreshToken, clientId, log, 120)
-      } else {
-        log('缺少 refresh_token 或 client_id，无法自动获取验证码')
-      }
-      
-      if (!loginVerificationCode) {
-        throw new Error('无法获取登录验证码')
-      }
-      
-      if (!await waitAndFill(page, loginCodeInput, loginVerificationCode, log, '登录验证码')) {
-        throw new Error('输入登录验证码失败')
-      }
-      
-      await page.waitForTimeout(1000)
-      
       const loginVerifySelector = 'button[data-testid="test-primary-button"]'
-      if (!await waitAndClickWithRetry(page, loginVerifySelector, log, '登录验证码确认按钮')) {
-        throw new Error('点击登录验证码确认按钮失败')
+      const loginCodeAccepted = await submitAwsVerificationCodeWithRecovery({
+        page,
+        codeInputSelector: loginCodeInput,
+        submitSelector: loginVerifySelector,
+        getCode: (ignoreCodes) => getAwsVerificationCode(useTempMail, tempMailToken, email, log, refreshToken, clientId, 120, ignoreCodes),
+        log,
+        inputDescription: '登录验证码',
+        submitDescription: '登录验证码确认按钮',
+        maxNewCodeAttempts: 3
+      })
+      if (!loginCodeAccepted) {
+        throw new Error('登录验证码提交失败，已尝试重新获取验证码')
       }
       
       await page.waitForTimeout(5000)
@@ -1450,28 +1985,7 @@ export async function autoRegisterAWS(
         throw new Error('未找到验证码输入框')
       }
       
-      await page.waitForTimeout(1000)
-      
-      let verificationCode: string | null = null
-      if (useTempMail) {
-        verificationCode = await getTempMailCode(tempMailToken, email, log, 120)
-      } else if (refreshToken && clientId) {
-        verificationCode = await getOutlookVerificationCode(refreshToken, clientId, log, 120)
-      } else {
-        log('缺少 refresh_token 或 client_id，无法自动获取验证码')
-      }
-      
-      if (!verificationCode) {
-        throw new Error('无法获取验证码')
-      }
-      
-      if (!await waitAndFill(page, codeInputSelector, verificationCode, log, '验证码')) {
-        throw new Error('输入验证码失败')
-      }
-      
-      await page.waitForTimeout(1000)
-      
-      log('检查并处理 Cookie 弹窗...')
+      log('快速检查 Cookie 弹窗...')
       const cookieAcceptSelectors = [
         'button:has-text("Accept")',
         'button:has-text("接受")',
@@ -1482,10 +1996,10 @@ export async function autoRegisterAWS(
       for (const selector of cookieAcceptSelectors) {
         try {
           const cookieButton = page.locator(selector).first()
-          if (await cookieButton.isVisible({ timeout: 2000 })) {
+          if (await cookieButton.isVisible({ timeout: 500 })) {
             await cookieButton.click()
             log('✓ 已点击 Cookie Accept 按钮')
-            await page.waitForTimeout(1000)
+            await page.waitForTimeout(300)
             break
           }
         } catch {
@@ -1499,13 +2013,23 @@ export async function autoRegisterAWS(
       const verifyButtonSelector = 'button[data-testid="email-verification-verify-button"]'
       const passwordInputSelector = 'input[placeholder="Enter password"]'
       
-      // 点击 Continue 按钮
-      if (!await waitAndClickWithRetry(page, verifyButtonSelector, log, 'Continue 按钮', 30000, 10)) {
-        throw new Error('点击 Continue 按钮失败')
+      const codeAccepted = await submitAwsVerificationCodeWithRecovery({
+        page,
+        codeInputSelector,
+        submitSelector: verifyButtonSelector,
+        getCode: (ignoreCodes) => getAwsVerificationCode(useTempMail, tempMailToken, email, log, refreshToken, clientId, 120, ignoreCodes),
+        log,
+        inputDescription: '验证码',
+        submitDescription: 'Continue 按钮',
+        successSelector: passwordInputSelector,
+        maxNewCodeAttempts: 3
+      })
+      if (!codeAccepted) {
+        throw new Error('验证码提交失败，已尝试重新获取验证码')
       }
       
       // 验证是否成功进入密码输入页面
-      await page.waitForTimeout(3000)
+      await page.waitForTimeout(1000)
       let passwordPageAppeared = false
       const maxVerifyRetries = 15
       
@@ -1761,28 +2285,55 @@ export async function autoRegisterAWS(
       log(`✓ 成功获取 SSO Token: ${ssoToken.substring(0, 50)}...`)
     }
     
-    await browser.close()
-    browser = null
-    
     if (ssoToken) {
       log('\n========== 操作成功! ==========')
+      if (keepBrowserOpen) {
+        const keptBrowser = browser
+        const keptContext = context
+        const keptPage = page
+        if (!keptBrowser || !keptContext || !keptPage) {
+          throw new Error('浏览器会话不存在，无法继续 PRO 检测')
+        }
+        log('✓ 保留当前注册浏览器，继续打开 Kiro 做 PRO 检测')
+        browser = null
+        context = null
+        page = null
+        return {
+          success: true,
+          ssoToken,
+          name: randomName,
+          email,
+          password,
+          browserSession: {
+            browser: keptBrowser,
+            context: keptContext,
+            page: keptPage,
+            close: async () => {
+              await keptBrowser.close().catch(() => undefined)
+            }
+          }
+        }
+      }
+      await browser.close()
+      browser = null
       return { success: true, ssoToken, name: randomName, email: email, password: password }
     } else {
       throw new Error('未能获取 SSO Token，可能操作未完成')
     }
     
   } catch (error) {
+    if (isBrowserClosedError(error)) {
+      log('\n✗ 注册中断: 浏览器页面已关闭（如果刚才按了 Ctrl+C，这是正常的中断提示）')
+      if (browser) {
+        try {
+          await browser.close()
+        } catch {}
+      }
+      return { success: false, error: '浏览器页面已关闭/任务被中断' }
+    }
     log(`\n✗ 注册失败: ${error}`)
     if (browser) {
       try {
-        let page: Page | null = null
-        try {
-          const contexts = browser.contexts()
-          if (contexts.length > 0) {
-            const pages = contexts[0].pages()
-            page = pages[0] || null
-          }
-        } catch {}
         await browser.close()
       } catch (e) {
         log(`关闭浏览器时出错: ${e}`)
@@ -1801,11 +2352,12 @@ export type TempMailRegisterOptions = {
   useFingerprint?: boolean
   fingerprintProfile?: any
   headless?: boolean
+  keepBrowserOpen?: boolean
 }
 
 export async function registerAwsBuilderIdTempMail(
   options: TempMailRegisterOptions
-): Promise<{ success: boolean; ssoToken?: string; name?: string; error?: string; email?: string; password?: string }> {
+): Promise<RegisterAwsResult> {
   return await autoRegisterAWS(
     undefined,
     undefined,
@@ -1820,6 +2372,7 @@ export async function registerAwsBuilderIdTempMail(
     options.verificationUri,
     options.useFingerprint ?? true,
     options.fingerprintProfile,
-    options.headless ?? true
+    options.headless ?? true,
+    options.keepBrowserOpen ?? false
   )
 }
